@@ -374,3 +374,52 @@ Monday briefing is simply skipped if the process was asleep at 08:00 ET.
 - `tasks.loop(time=...)` accepts only a time of day, not a weekday, so the loop
   fires daily at 08:00 ET and returns immediately unless
   `date.weekday() == 0`. The Monday-only behaviour is enforced inside the body.
+
+### 2026-10-08 16:26 PT — Phase 4: Macro release polling
+
+**Added**
+- `cogs/macro_alerts.py` — polls FRED every 15 minutes for `CPIAUCSL`,
+  `PCEPILFE` and `GDPC1`, and posts an alert the first time a new observation
+  date appears.
+  - **State cache:** `state/macro_state.json` maps each series to the newest
+    observation date already announced. Dates are compared as ISO strings, which
+    sort correctly, so no parsing is needed.
+  - **Seeding:** a series with no cache entry has its current observation date
+    recorded *without* announcing. Without this, switching the bot on would
+    replay every release in the lookback window into the channel at once.
+  - **Atomic writes:** the cache is written to a `.tmp` file and then moved into
+    place, so a crash mid-write cannot leave a corrupt JSON file behind.
+  - **Write-after-post:** the cache is only advanced once a message actually
+    sends. A failed post is retried on the next poll instead of being silently
+    swallowed.
+  - **Alert contents:** release category, period label (month for monthly
+    series, quarter for GDP), new value, previous value, change versus the prior
+    period, change versus a year ago, and the release window it landed in.
+  - **Isolation:** each series is fetched independently, so one failing series
+    cannot stop the other two from being checked.
+  - Retries use exponential backoff (3 attempts), and the whole body is wrapped
+    so no exception can stop the loop permanently.
+
+**Modified**
+- `verify.py` — added an embed-rendering section that builds both embeds from
+  synthetic data. It feeds in a company with null fields (to prove nulls are
+  skipped rather than rendered as "None") and 40 companies on one day (to prove
+  the per-day cap and overflow line work), then asserts every field stays inside
+  Discord's 1024-character limit.
+
+**Verified**
+- `python verify.py` — **24/24 checks passed**.
+- Both loops register: `weekly_briefing` at `08:00 America/New_York`, and
+  `poll_macro_releases` every 15 minutes.
+- Briefing embed renders 2 day fields with the widest at 592 characters — well
+  inside the cap.
+- Macro alert embed renders 6 fields; period labels verified as `Q2 2026`
+  (quarterly) and `June 2026` (monthly).
+
+**Deviation from spec**
+- The 02:00 PM ET FOMC window is currently **label-only**. The brief specifies
+  monitoring CPI, Core PCE and Real GDP — none of which is a rate decision — so
+  no monitored series can produce a 14:00 release. The window is defined and
+  reported in the alert footer, and making it functional is a one-line change:
+  add `DFEDTARU` (fed funds target range, upper limit) to `MONITORED_SERIES`.
+  This is noted in a comment at the definition rather than silently left empty.

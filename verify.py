@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import discord
 from discord.ext import commands, tasks
@@ -137,6 +137,79 @@ async def main() -> int:
     for name in list(client.cogs):
         await client.remove_cog(name)
     await client.close()
+
+    # --------------------------------------------------------------- rendering
+    section("embed rendering (synthetic data, no network)")
+
+    from cogs.macro_alerts import MONITORED_SERIES, MacroAlerts
+    from cogs.scheduled_briefings import ScheduledBriefings
+
+    check(
+        "Three FRED series monitored",
+        set(MONITORED_SERIES) == {"CPIAUCSL", "PCEPILFE", "GDPC1"},
+        ", ".join(MONITORED_SERIES),
+    )
+
+    monday = date(2026, 10, 5)
+    friday = monday + timedelta(days=4)
+    sample = [
+        {
+            "date": monday.isoformat(),
+            "symbol": "AAPL",
+            "quarter": 4,
+            "year": 2026,
+            "epsEstimate": 1.2345,
+            "hour": "amc",
+        },
+        # Deliberately missing fields, to prove nulls are skipped rather than rendered.
+        {"date": monday.isoformat(), "symbol": "ZZZZ", "epsEstimate": None, "hour": None},
+        # Overflow, to force the per-day cap and the "…and N more" line.
+        *[
+            {
+                "date": friday.isoformat(),
+                "symbol": f"T{index:03d}",
+                "quarter": 1,
+                "year": 2026,
+                "epsEstimate": float(index),
+                "hour": "bmo",
+            }
+            for index in range(40)
+        ],
+    ]
+
+    try:
+        briefing = ScheduledBriefings._build_embed(monday, friday, sample)
+        check("Briefing embed builds", True, f"{len(briefing.fields)} day field(s)")
+        widest = max((len(field.value) for field in briefing.fields), default=0)
+        check(
+            "Briefing fields fit Discord's 1024-char cap",
+            widest <= 1024,
+            f"widest={widest}",
+        )
+        rendered = " ".join(field.value for field in briefing.fields)
+        check("Briefing includes the priority name", "AAPL" in rendered)
+        check("Briefing reports overflow", "more" in rendered)
+    except Exception as error:  # noqa: BLE001 - reporting the failure is the point
+        check("Briefing embed builds", False, f"{type(error).__name__}: {error}")
+
+    try:
+        alert = MacroAlerts._alert_embed(
+            "CPIAUCSL",
+            {
+                "date": date(2026, 9, 1),
+                "value": 325.4,
+                "previous": 324.1,
+                "year_ago": 315.2,
+            },
+            "08:30 ET window (CPI / PCE / GDP)",
+        )
+        check("Macro alert embed builds", True, f"{len(alert.fields)} field(s)")
+    except Exception as error:  # noqa: BLE001
+        check("Macro alert embed builds", False, f"{type(error).__name__}: {error}")
+
+    for periods, expected in ((4, "Q2 2026"), (12, "June 2026")):
+        label = MacroAlerts._period_label(date(2026, 6, 30), periods)
+        check(f"Period label for {periods}/yr", label == expected, label)
 
     # ----------------------------------------------------------------- summary
     section("summary")
