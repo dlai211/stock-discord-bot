@@ -289,3 +289,50 @@ Monday briefing is simply skipped if the process was asleep at 08:00 ET.
   Windows ships no system timezone database, so `zoneinfo.ZoneInfo("America/New_York")`
   raises `ZoneInfoNotFoundError` without it. This would break the Monday 08:00 ET
   schedule on this machine.
+
+### 2026-10-08 16:24 PT — Phase 2: Core architecture & interactive commands
+
+**Added**
+- `bot.py` — `FinanceBot` (`commands.Bot`, prefix `!`, `message_content=True`).
+  `setup_hook()` discovers and loads every module in `cogs/`, then syncs the
+  slash command tree. `on_ready` logs the bot username and latency. Global error
+  handlers cover both prefix commands (`on_command_error`) and slash commands
+  (`tree.on_error`), unwrapping `CommandInvokeError` and translating
+  `MissingPermissions` / `CheckFailure` / `MissingRequiredArgument` into plain
+  messages instead of tracebacks.
+- `config.py` — the single module that reads `.env`. Exposes typed settings plus
+  `missing_variables()` for a friendly startup failure, and a DST-aware
+  `EASTERN` timezone.
+- `utils.py` — number formatting for embeds (`format_compact`,
+  `format_money`, `format_number`, `format_signed`), plus `run_blocking()`
+  (moves synchronous HTTP libraries onto a worker thread so they cannot stall
+  the event loop), `retry_async()` (exponential backoff with a `give_up_on`
+  escape hatch), and `resolve_channel()` (falls back to an API fetch when a
+  scheduled post runs before the channel cache is warm).
+- `cogs/__init__.py`
+- `cogs/market_commands.py` — `/stock` and `/macro`, described in §5.
+- `verify.py` — offline smoke test. Loads every cog the way `bot.py` does,
+  introspects the provider APIs, and checks the schedule and timezone, without
+  logging in or making a network call.
+
+**Modified**
+- `PRD.md` — architecture, environment variable, API integration and command
+  schema sections written out; changelog entry added.
+
+**Verified**
+- `python verify.py` — **11/13 checks pass**. The two failures are the Phase 3
+  and Phase 4 background loops, which do not exist yet.
+- Confirmed `TARGET_CHANNEL_ID` parses to `961806288650657833`, and that
+  `zoneinfo` resolves US/Eastern to the correct −4h (EDT) offset on today's date.
+- Both slash commands register: `stock`, `macro`.
+- Note: discord.py logs `PyNaCl is not installed` / `davey is not installed`.
+  Those are voice-support warnings and do not affect a text-only bot.
+
+**Deviation from spec**
+- The slash command tree is synced in `setup_hook()` rather than `on_ready()` as
+  the brief specified. `on_ready` fires again on every reconnect and Discord
+  rate-limits global command syncs, so syncing once after the cogs have
+  registered their commands is both correct and cheaper. `on_ready` still logs
+  the username and latency, and the sync result is logged on startup.
+- `verify.py` was created here rather than in Phase 5 so that every later phase
+  could be checked as it landed. Phase 5 runs it as the final gate.
