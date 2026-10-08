@@ -1,0 +1,8 @@
+﻿venv/
+.env
+__pycache__/
+*.pyc
+
+# Runtime state written by the macro alert poller
+state/
+*.log

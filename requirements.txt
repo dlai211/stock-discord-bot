@@ -1,0 +1,22 @@
+# Discord bot framework
+discord.py>=2.3.0
+
+# Loads variables from .env
+python-dotenv>=1.0.0
+
+# Market quotes (/stock)
+yfinance>=0.2.30
+
+# Economic data from the St. Louis Fed (/macro, macro alerts)
+fredapi>=0.5.0
+
+# Earnings calendar (weekly briefing)
+finnhub-python>=2.4.0
+
+# Timezone handling for the Monday 08:00 US/Eastern schedule
+pytz>=2023.3
+# Windows ships no system tz database, so zoneinfo needs this package.
+tzdata>=2024.1
+
+# Direct HTTP access for provider fallbacks
+requests>=2.31.0
