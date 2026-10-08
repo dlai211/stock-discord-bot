@@ -211,17 +211,36 @@ The repo includes a `Procfile`:
 worker: python bot.py
 ```
 
-Any Procfile-based host works (Railway, Render, Heroku). On such a host, set the
-four environment variables in the dashboard rather than shipping `.env` — the
-code reads real environment variables first and `.env` only fills the gaps.
+Use the **worker** process type, not `web`. The bot holds a persistent websocket
+to Discord and never listens on a port, so hosting it as a web process makes the
+platform health-check a port that nothing is bound to.
 
-**Never commit `.env`.** On a host that only supports the filesystem, prefer its
-secret manager over uploading the file.
+### Railway / Render / Heroku
 
-Note that a free-tier host that sleeps on inactivity will disconnect the bot and
-miss scheduled posts. Schedules are time-of-day based rather than
-interval-based, so a bot that boots late does not fire a catch-up post — the
-Monday briefing is simply skipped if the process was asleep at 08:00 ET.
+1. Push the repo to GitHub — confirm `.env` is not in the commit first.
+2. Create a project from the repo. `Procfile` and `requirements.txt` are read
+   automatically, so no build configuration is needed.
+3. Add the four variables in the dashboard's variables/secrets panel:
+   `DISCORD_TOKEN`, `FINNHUB_KEY`, `TARGET_CHANNEL_ID`, `FRED_API_KEY`.
+   Do not upload `.env`.
+4. Deploy and check the logs for, in order:
+   `Loaded 3 cog(s)` → `Synced 2 slash command(s) globally` →
+   `Logged in as <name>`.
+
+`config.py` reads real environment variables first and only fills gaps from
+`.env`, so dashboard variables take precedence and no `.env` file needs to exist
+on the host at all.
+
+**Never commit `.env`.** Prefer the platform's secret manager over uploading the
+file.
+
+### Sleep behaviour
+
+Time-of-day schedules do not catch up. If the host suspends an idle worker, the
+Monday 08:00 ET briefing is simply skipped for that week — `tasks.loop(time=...)`
+computes the *next* occurrence, it does not fire a missed one on boot. A
+free tier that sleeps will therefore miss briefings and macro alerts. Enable the
+always-on / no-sleep option if that matters to you.
 
 ---
 
@@ -322,8 +341,9 @@ Monday briefing is simply skipped if the process was asleep at 08:00 ET.
 **Verified**
 - `python verify.py` — **11/13 checks pass**. The two failures are the Phase 3
   and Phase 4 background loops, which do not exist yet.
-- Confirmed `TARGET_CHANNEL_ID` parses to `961806288650657833`, and that
-  `zoneinfo` resolves US/Eastern to the correct −4h (EDT) offset on today's date.
+- Confirmed `TARGET_CHANNEL_ID` parses to an integer, and that `zoneinfo`
+  resolves US/Eastern to the correct −4h (EDT) offset on today's date. The
+  channel ID itself is deliberately not reproduced in this document.
 - Both slash commands register: `stock`, `macro`.
 - Note: discord.py logs `PyNaCl is not installed` / `davey is not installed`.
   Those are voice-support warnings and do not affect a text-only bot.
@@ -423,3 +443,51 @@ Monday briefing is simply skipped if the process was asleep at 08:00 ET.
   reported in the alert footer, and making it functional is a one-line change:
   add `DFEDTARU` (fed funds target range, upper limit) to `MONITORED_SERIES`.
   This is noted in a comment at the definition rather than silently left empty.
+
+### 2026-10-08 16:27 PT — Phase 5: Verification & cloud readiness
+
+**Added**
+- `Procfile` — `worker: python bot.py`.
+
+**Modified**
+- `PRD.md` — §7 Deployment rewritten with concrete per-platform steps, an
+  explicit warning to use the **worker** process type rather than `web` (the bot
+  never binds a port, so a web health check would fail), and a note that
+  time-of-day schedules do not fire a catch-up post after a host sleeps.
+
+**Verified**
+- `python -m compileall` across `bot.py`, `config.py`, `utils.py`, `verify.py`
+  and all four files in `cogs/` — exit 0, no syntax errors.
+- `python verify.py` — **24/24 checks passed**, exit 0. All three cogs load
+  without connecting to Discord; both background loops register with the
+  expected schedule; both embeds render from synthetic data inside Discord's
+  field limits.
+- Secret scan: every value in `.env` was searched for across all 12 tracked
+  files. **No value appears in any tracked file**, and `.env` is untracked.
+
+**Correction made during this phase**
+- The Phase 2 entry above originally reproduced the literal `TARGET_CHANNEL_ID`
+  value in its "Verified" notes. That has been replaced with a redacted
+  description. The scan above is what caught it.
+- No credential was ever committed: the Discord token, Finnhub key and FRED key
+  were confirmed absent from every tracked file, both before and after the fix.
+  A Discord channel ID is not usable to authenticate — it identifies a channel,
+  not a secret — but it is still an environment value and does not belong in a
+  repo that may become public.
+
+### Final state
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 3/3 |
+| Slash commands registered | `/stock`, `/macro` |
+| Background loops | `weekly_briefing` @ 08:00 ET Mondays, `poll_macro_releases` every 15 min |
+| Tracked files containing a secret | 0 |
+| `.env` tracked | No |
+| Byte-compile | Clean |
+| Offline check suite | 24/24 |
+
+**Not verified by design:** the bot was never connected to Discord. The user
+chose offline verification, so login, live slash-command sync, real provider
+responses, and the scheduled posts have not been exercised against the live
+services. Run `venv\Scripts\python.exe bot.py` when ready to confirm those.
