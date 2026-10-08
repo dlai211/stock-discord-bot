@@ -336,3 +336,41 @@ Monday briefing is simply skipped if the process was asleep at 08:00 ET.
   the username and latency, and the sync result is logged on startup.
 - `verify.py` was created here rather than in Phase 5 so that every later phase
   could be checked as it landed. Phase 5 runs it as the final gate.
+
+### 2026-10-08 16:25 PT — Phase 3: Scheduled Monday briefing
+
+**Added**
+- `cogs/scheduled_briefings.py` — a `tasks.loop` that posts the week's earnings
+  calendar to `TARGET_CHANNEL_ID`.
+  - Fires at 08:00 US/Eastern via a tz-aware `datetime.time`, so DST is handled
+    by the timezone database rather than by a hard-coded UTC offset.
+  - Pulls Monday–Friday from Finnhub's `earnings_calendar`.
+  - Sorts a curated 37-name high-interest list first and marks those entries ⭐,
+    then fills remaining space alphabetically.
+  - Caps the listing at 12 lines per day and 25 overall, keeping each embed field
+    under Discord's 1024-character limit; overflow is reported as "*…and N more*".
+  - Shows quarter, consensus EPS estimate and before-open/after-close timing per
+    company, skipping any field the API leaves null.
+  - Wrapped in `try/except` at two levels — the fetch and the send — so a provider
+    outage or a permissions error costs one week's briefing rather than
+    cancelling the loop permanently.
+
+**Verified**
+- `python verify.py` — **14/14 checks passed**.
+- Confirmed the registered loop reports `08:00 tz=America/New_York`, proving the
+  `zoneinfo`-backed schedule resolves correctly rather than silently falling back
+  to UTC.
+
+**Bugs found and fixed during this phase**
+- `tasks.Loop` in discord.py 2.7.1 exposes only a private `_name`, not the public
+  `.name` the docs imply. `verify.py` now identifies each loop by the attribute
+  it is bound to on its cog.
+- `Client.wait_until_ready()` **raises** `RuntimeError` when the client was never
+  logged in — it does not simply wait. The briefing's `before_loop` hook now
+  catches that, which both lets the offline check run cleanly and prevents a
+  startup race from killing the schedule for good.
+
+**Deviation from spec**
+- `tasks.loop(time=...)` accepts only a time of day, not a weekday, so the loop
+  fires daily at 08:00 ET and returns immediately unless
+  `date.weekday() == 0`. The Monday-only behaviour is enforced inside the body.

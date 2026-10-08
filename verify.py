@@ -103,15 +103,19 @@ async def main() -> int:
     # --------------------------------------------------------- background tasks
     section("background tasks")
 
+    # tasks.Loop exposes no public name in this version, so identify each loop
+    # by the attribute it was assigned to on its cog.
     loops = [
-        member
+        (attribute, member)
         for cog in client.cogs.values()
-        for _, member in inspect.getmembers(cog, lambda obj: isinstance(obj, tasks.Loop))
+        for attribute, member in inspect.getmembers(
+            cog, lambda obj: isinstance(obj, tasks.Loop)
+        )
     ]
-    print(f"registered loops: {', '.join(loop.name for loop in loops) if loops else 'none'}")
+    print(f"registered loops: {', '.join(name for name, _ in loops) if loops else 'none'}")
     check("At least one background loop registered", bool(loops))
 
-    briefing = next((loop for loop in loops if loop.name == "weekly_briefing"), None)
+    briefing = next((loop for name, loop in loops if name == "weekly_briefing"), None)
     if briefing is None:
         check("weekly_briefing loop present", False)
     elif not briefing.time:
@@ -124,7 +128,7 @@ async def main() -> int:
             f"{scheduled.hour:02d}:{scheduled.minute:02d} tz={scheduled.tzinfo}",
         )
 
-    poller = next((loop for loop in loops if loop.name == "poll_macro_releases"), None)
+    poller = next((loop for name, loop in loops if name == "poll_macro_releases"), None)
     if poller is not None:
         check("macro poller interval set", poller.minutes > 0, f"every {poller.minutes} min")
 
