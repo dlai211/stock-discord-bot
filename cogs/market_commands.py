@@ -39,6 +39,12 @@ FRED_SERIES = {
 # FRED payload small.
 FRED_LOOKBACK_DAYS = 730
 
+# CPI is the headline inflation series. The year-over-year rate compares the
+# newest monthly observation against the one 12 months earlier, so the window
+# spans 13 observations.
+CPI_SERIES_ID = "CPIAUCSL"
+CPI_YOY_PERIODS = 12
+
 
 class LookupFailed(Exception):
     """The provider answered, but has nothing for the requested symbol."""
@@ -198,7 +204,7 @@ class MarketCommands(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         try:
-            observations = await retry_async(
+            observations, cpi = await retry_async(
                 self._fetch_fred_series, attempts=3, base_delay=2.0, label="FRED"
             )
         except Exception:
@@ -211,40 +217,79 @@ class MarketCommands(commands.Cog):
             )
             return
 
-        await interaction.followup.send(embed=self._macro_embed(observations))
+        await interaction.followup.send(embed=self._macro_embed(observations, cpi))
 
-    async def _fetch_fred_series(self) -> dict[str, dict[str, Any]]:
-        """Latest reading (and the one before it) for each tracked series."""
+    async def _fetch_fred_series(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
+        """Latest readings for the headline rates, plus CPI year-over-year."""
         start = (
             datetime.now(timezone.utc).date() - timedelta(days=FRED_LOOKBACK_DAYS)
         ).isoformat()
 
         observations: dict[str, dict[str, Any]] = {}
-        for series_id in FRED_SERIES:
+        cpi: dict[str, Any] | None = None
+
+        for series_id in (*FRED_SERIES, CPI_SERIES_ID):
             frame = await run_blocking(
                 self._fred.get_series, series_id, observation_start=start
             )
-            # DGS10/DGS2 are business-day series and carry NaN on holidays.
+            # DGS10/DGS2 are business-day series and carry NaN on holidays, and
+            # FRED pads monthly series with NaN for periods it has not published.
             clean = frame.dropna() if frame is not None else None
             if clean is None or clean.empty:
                 log.warning("FRED series %s returned no usable observations", series_id)
                 continue
+
+            if series_id == CPI_SERIES_ID:
+                cpi = self._cpi_year_over_year(clean)
+                continue
+
             observations[series_id] = {
                 "value": float(clean.iloc[-1]),
                 "date": clean.index[-1].date(),
                 "previous": float(clean.iloc[-2]) if len(clean) > 1 else None,
             }
-        return observations
+
+        return observations, cpi
 
     @staticmethod
-    def _macro_embed(observations: dict[str, dict[str, Any]]) -> discord.Embed:
+    def _cpi_year_over_year(series: Any) -> dict[str, Any] | None:
+        """Year-over-year inflation across the latest 13 monthly observations.
+
+        Returns None when FRED has not published a full 13-month window, which
+        is the case early in a series' life or after a long outage.
+        """
+        window = series.tail(CPI_YOY_PERIODS + 1)
+        if len(window) < CPI_YOY_PERIODS + 1:
+            return None
+
+        latest = float(window.iloc[-1])
+        year_ago = float(window.iloc[0])
+        if not year_ago:
+            return None
+
+        return {
+            "latest": latest,
+            "latest_date": window.index[-1].date(),
+            "year_ago": year_ago,
+            "year_ago_date": window.index[0].date(),
+            "yoy_percent": (latest - year_ago) / year_ago * 100,
+            "observations": int(len(window)),
+        }
+
+    @staticmethod
+    def _macro_embed(
+        observations: dict[str, dict[str, Any]],
+        cpi: dict[str, Any] | None = None,
+    ) -> discord.Embed:
         embed = discord.Embed(
             title="US Rates & Macro Snapshot",
             color=COLOR_NEUTRAL,
             timestamp=datetime.now(timezone.utc),
         )
 
-        if not observations:
+        if not observations and cpi is None:
             embed.description = "FRED returned no observations for any tracked series."
             return embed
 
@@ -283,8 +328,29 @@ class MarketCommands(commands.Cog):
                     inline=False,
                 )
 
+        if cpi is not None:
+            embed.add_field(
+                name="CPI Inflation (YoY)",
+                value=(
+                    f"**{format_signed(cpi['yoy_percent'], 2, '%')}** over 12 months\n"
+                    f"{cpi['latest_date']:%B %Y} at {cpi['latest']:,.2f} vs "
+                    f"{cpi['year_ago_date']:%B %Y} at {cpi['year_ago']:,.2f}\n"
+                    f"*latest {cpi['observations']} observations of CPIAUCSL*"
+                ),
+                inline=False,
+            )
+        elif observations:
+            embed.add_field(
+                name="CPI Inflation (YoY)",
+                value="Unavailable — FRED has not published a full 13-month window yet.",
+                inline=False,
+            )
+
         embed.set_footer(
-            text="Source: FRED · FEDFUNDS is a monthly average; DGS10/DGS2 are daily"
+            text=(
+                "Source: FRED · FEDFUNDS is a monthly average; DGS10/DGS2 are daily; "
+                "CPI is seasonally adjusted"
+            )
         )
         return embed
 
