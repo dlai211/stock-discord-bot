@@ -82,6 +82,11 @@ Discord ──► bot.py (setup_hook loads cogs, syncs tree)
    exception escapes it. Every loop body is wrapped in `try/except`.
 5. **No duplicate posts.** `macro_alerts` keeps a seen-observation-date cache on
    disk, so a restart never replays an alert.
+6. **Schedules run on the Eastern clock; everything displayed is Pacific.**
+   Exchanges and the release calendar work in US/Eastern, so windows are defined
+   there. Every time a reader sees is converted to US/Pacific through
+   `zoneinfo` — never by subtracting three hours — and derived from the Eastern
+   definition rather than typed in twice. See §5.7.
 
 ---
 
@@ -161,7 +166,10 @@ rather than showing a partial calculation.
 - **Caps:** max 12 lines per day and 25 lines overall, keeping each embed field
   safely under Discord's 1024-character limit.
 - **Failure handling:** a failed Finnhub call logs and skips the week rather than
-  cancelling the schedule.
+  cancelling the schedule. A failed *snapshot* call does not even cost the week —
+  the briefing still posts, with the missing quotes rendered `N/A`.
+- **Market snapshot:** a `📊 Market Snapshot (Monday Open)` field covering 17
+  assets across crypto, equities, bonds, commodities and currencies. See §5.8.
 
 ### 5.4 Macro Release Alerts — `cogs/macro_alerts.py`
 
@@ -175,8 +183,9 @@ rather than showing a partial calculation.
 - **State is written only after a successful post**, so a failed send is retried
   on the next poll instead of being silently lost.
 
-Release windows are tracked as labels (08:25–09:30 ET and 13:55–14:45 ET) and
-recorded in the alert footer.
+Release windows are tracked as labels and recorded in the alert footer. They are
+defined in Eastern and displayed in Pacific — `05:25-06:30 PT window
+(CPI / PCE / GDP)` and `10:55-11:45 PT window (FOMC)`. See §5.7.
 
 ### 5.5 Test commands
 
@@ -242,6 +251,95 @@ failing.
 > loop's `time=` argument (it accepts a list), for example 08:00 ET the
 > following morning. See the changelog entry for why this is not enabled by
 > default.
+
+### 5.7 Time handling
+
+Two clocks are in play, and mixing them up is the easiest way to ship a wrong
+time, so the rule is fixed:
+
+- **Schedules are defined in US/Eastern** — the clock the exchanges and the
+  release calendar run on. The briefing fires at 08:00 ET, the earnings check at
+  17:30 ET, and the release windows are 08:25–09:30 ET and 13:55–14:45 ET.
+- **Everything a reader sees is US/Pacific.** `utils.to_pacific_clock()` converts
+  through `zoneinfo("America/Los_Angeles")` against a real date, so PST/PDT is
+  applied by the timezone database rather than by subtracting three hours.
+
+Pacific labels are **derived from the Eastern definition**, never typed in
+twice, so a window can only be edited in one place:
+
+| Earnings code | Eastern | Displayed |
+|---|---|---|
+| `bmo` | 08:30–09:30 | `Pre-Market (~05:30-06:30 PT)` |
+| `amc` | 16:00–17:00 | `Post-Market (~13:00-14:00 PT)` |
+| `dmh` | 09:30–16:00 | `Market Hours (~06:30-13:00 PT)` |
+
+| Release window | Eastern | Displayed |
+|---|---|---|
+| CPI / PCE / GDP | 08:25–09:30 | `05:25-06:30 PT window` |
+| FOMC | 13:55–14:45 | `10:55-11:45 PT window` |
+
+The **trigger** for every one of these stays Eastern; only the label converts.
+ET and PT currently always differ by exactly three hours because US DST rules
+align, but the conversion goes through the timezone database regardless, so the
+labels remain correct if a window is redefined or the rules ever diverge. This is
+asserted in `verify.py`, including across a DST boundary.
+
+### 5.8 Market snapshot — `cogs/scheduled_briefings.py`
+
+A `📊 Market Snapshot (Monday Open)` field on the Monday briefing, covering 17
+assets in five groups.
+
+| Group | Assets |
+|---|---|
+| Crypto | BTC, ETH, HYPE, XMR |
+| Equities | SP500 (`SPY`), QQQ, World (`URTH`), EEM |
+| Bonds | HYG, US 10Y Yield (`^TNX`) |
+| Commodities | Crude Oil (`CL=F`), Gold (`GC=F`), Silver (`SI=F`) |
+| Currencies | EUR/USD, USD/JPY, AUD/USD, USD/CHF |
+
+Rendered as a fenced code block using tree branches, so the columns stay aligned
+in Discord's monospace font:
+
+```
+Crypto
+├ BTC: $81,661.02 | -1.94%
+├ ETH: $2,474.37 | -3.85%
+├ HYPE: $83.85 | -5.22%
+└ XMR: $541.48 | -2.18%
+Equities
+├ SP500: $777.22 | -0.24%
+…
+```
+
+**Fetching.** All 17 symbols come from **one batched `yf.download()` call**, not
+seventeen `Ticker` round trips, run through `utils.run_blocking()` so the event
+loop is never stalled. `auto_adjust=False` keeps raw closes, so the daily change
+is not skewed by dividend adjustments.
+
+**Value formatting** is driven by a per-asset `kind`:
+
+| Kind | Renders as | Used by |
+|---|---|---|
+| `usd` | `$67,421.30`, six decimals below $1 | crypto, equities, commodities |
+| `percent` | `5.23%` | `^TNX`, which already quotes its yield in percent |
+| `rate` | `1.0876`, or two decimals above 50 | FX pairs |
+
+The change column is the relative percentage move against the previous close.
+For `^TNX` that is a *relative* change in the yield rather than a basis-point
+move — the layout calls for a uniform row format, but it is worth knowing when
+reading the bond line.
+
+**Failure handling.** A symbol that does not resolve, or that has no previous
+close, renders `N/A` rather than raising. If the entire batch fails, the
+briefing still posts with every row as `N/A`.
+
+**Symbol gotcha.** Yahoo lists Hyperliquid under `HYPE32196-USD`; the obvious
+`HYPE-USD` returns no data at all. Every symbol in the table was checked against
+live Yahoo data when this was added — 17/17 resolve.
+
+**Placement.** The snapshot is the last field in the embed, after the day-by-day
+earnings. The earnings detail is the point of the post, so it should stay the
+first thing read; move the field earlier if market context matters more to you.
 
 ---
 
@@ -653,3 +751,80 @@ import list would have been a regression.
 **Still not exercised:** posting behaviour for the new commands, a real earnings
 result embed from live Finnhub data, and the 17:30 check firing on schedule.
 Run `/test_briefing` and `/test_macro_alert` in Discord to confirm those.
+
+### 2026-10-08 17:20 PT — Briefing: Pacific display times and Monday market snapshot
+
+**Added**
+- **Pacific display conversion.** `config.PACIFIC` (`America/Los_Angeles`) and
+  `utils.to_pacific_clock()`. Every time shown to a reader is now converted
+  through `zoneinfo`. See §5.7.
+- **`📊 Market Snapshot (Monday Open)`**, a 17-asset field on the Monday
+  briefing. See §5.8.
+
+**Modified**
+- `config.py` — added `PACIFIC` alongside `EASTERN`, loaded under the same
+  `zoneinfo`/`pytz` fallback.
+- `utils.py` — added `to_pacific_clock()`.
+- `cogs/scheduled_briefings.py` — `TIMING_LABELS` replaced by `TIMING_WINDOWS`,
+  which stores each slot as an Eastern time range; `timing_label()` derives the
+  Pacific text from it. Added the snapshot constants, the batched fetch, the
+  block renderer, and the new embed field. Footer now reads *times are
+  US/Pacific*. `_build_embed` no longer returns early when the week has no
+  earnings, so the snapshot renders in that case too.
+- `cogs/macro_alerts.py` — `RELEASE_WINDOWS` now holds Eastern hours rather than
+  pre-formatted minute offsets; `release_window_label()` derives the Pacific
+  text. The *trigger* comparison is unchanged.
+- `verify.py` — grown from 48 to **78 checks**.
+
+**Bug found and fixed**
+- **`HYPE-USD` does not exist on Yahoo Finance.** A live symbol check returned
+  16/17: Yahoo lists Hyperliquid under the numeric-suffixed `HYPE32196-USD`, and
+  the obvious symbol returns no data at all. Left unfixed, that row would have
+  read `N/A` forever with no error anywhere. The correct symbol is now
+  configured, and all 17 resolve.
+
+**Verified**
+- `python verify.py` — **78/78 checks passed**, exit 0.
+- Pacific DST confirmed: `America/Los_Angeles` resolves to −7h in July and −8h in
+  January, and `to_pacific_clock(8, 30)` returns `05:30` on both a summer and a
+  winter date — so the display is stable across the DST boundary.
+- The two labels the brief named are asserted as **exact strings**:
+  `Pre-Market (~05:30-06:30 PT)` and `Post-Market (~13:00-14:00 PT)`.
+- Snapshot renderer checked for fenced blocks, tree branches, presence of all
+  five groups, the `N/A` fallback for both a missing previous close and a wholly
+  absent symbol, and that every block and every resulting embed field stays
+  inside Discord's 1024-character cap (a realistic render is 494 characters).
+- Asserted that the snapshot still renders when the week has **no** earnings —
+  a regression test for the early return removed above.
+- **Live Yahoo check:** all 17 symbols fetched successfully. The 10Y yield came
+  back at `5.231`, confirming the `percent` kind renders it as `5.23%` rather
+  than scaling it.
+- `python -m compileall` across all cogs — exit 0.
+
+**Notes**
+- **On "Monday Open".** The briefing fires at 08:00 ET, which is 05:00 PT —
+  before the 06:30 PT equity open. Equity, bond and commodity rows therefore
+  reflect **Friday's close**, not a Monday opening print. Crypto trades
+  continuously, so those rows are live. The field name is as specified; the
+  data it holds is the latest available, not literally the Monday open.
+- **Live network call made during this phase.** Verifying the symbol list
+  required one read-only, unauthenticated request to Yahoo Finance. No API key
+  and no Discord connection was involved.
+- **Formatting tweaks beyond the brief:** FX pairs above 50 render to two
+  decimals (`USD/JPY: 158.07`) rather than four, and dollar-quoted assets below
+  $1 render to six decimals — both to avoid absurd-looking output. USD/JPY at
+  four decimals would have read `158.0700`.
+- `URTH` was chosen over `VT` for the "World" line, since `VT` (total world)
+  would overlap with the `EEM` emerging-markets line directly beneath it.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 7 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Market snapshot symbols resolving | 17/17 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 78/78 |

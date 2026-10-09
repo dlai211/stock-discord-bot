@@ -67,6 +67,37 @@ async def main() -> int:
         str(config.TARGET_CHANNEL_ID),
     )
 
+    # ------------------------------------------------------------ time display
+    section("timezone display")
+
+    pacific_summer = datetime(2026, 7, 15, 12, tzinfo=config.PACIFIC).utcoffset()
+    pacific_winter = datetime(2026, 1, 15, 12, tzinfo=config.PACIFIC).utcoffset()
+    check(
+        "Pacific observes DST (PDT -7, PST -8)",
+        pacific_summer == timedelta(hours=-7) and pacific_winter == timedelta(hours=-8),
+        f"Jul={pacific_summer}, Jan={pacific_winter}",
+    )
+
+    from utils import to_pacific_clock
+
+    check(
+        "08:30 Eastern renders as 05:30 Pacific",
+        to_pacific_clock(8, 30) == "05:30",
+        to_pacific_clock(8, 30),
+    )
+    check(
+        "16:00 Eastern renders as 13:00 Pacific",
+        to_pacific_clock(16, 0) == "13:00",
+        to_pacific_clock(16, 0),
+    )
+    summer_label = to_pacific_clock(8, 30, reference=date(2026, 7, 15))
+    winter_label = to_pacific_clock(8, 30, reference=date(2026, 1, 15))
+    check(
+        "Conversion is stable across the DST boundary",
+        summer_label == winter_label == "05:30",
+        f"Jul={summer_label}, Jan={winter_label}",
+    )
+
     # ----------------------------------------------------------- provider APIs
     section("provider APIs (introspection, no network)")
 
@@ -164,9 +195,18 @@ async def main() -> int:
     section("embed rendering (synthetic data, no network)")
 
     from cogs.earnings_tracker import EarningsTracker
-    from cogs.macro_alerts import MONITORED_SERIES, MacroAlerts
+    from cogs.macro_alerts import (
+        MONITORED_SERIES,
+        RELEASE_WINDOWS,
+        MacroAlerts,
+        release_window_label,
+    )
     from cogs.market_commands import MarketCommands
-    from cogs.scheduled_briefings import ScheduledBriefings
+    from cogs.scheduled_briefings import (
+        SNAPSHOT_GROUPS,
+        ScheduledBriefings,
+        timing_label,
+    )
 
     check(
         "Three FRED series monitored",
@@ -285,6 +325,124 @@ async def main() -> int:
         "Weekend rolls forward to the coming week",
         weekend == (date(2026, 10, 12), date(2026, 10, 16)),
         f"{weekend[0]} -> {weekend[1]}",
+    )
+
+    # -------------------------------------------------- reported display times
+    section("reporting slot labels (US/Pacific)")
+
+    check(
+        "Pre-market label matches the spec",
+        timing_label("bmo") == "Pre-Market (~05:30-06:30 PT)",
+        timing_label("bmo"),
+    )
+    check(
+        "Post-market label matches the spec",
+        timing_label("amc") == "Post-Market (~13:00-14:00 PT)",
+        timing_label("amc"),
+    )
+    check("Market-hours label is derived too", timing_label("dmh") != "", timing_label("dmh"))
+    check("An unknown timing code yields no label", timing_label("zzz") == "")
+    check("A missing timing code yields no label", timing_label("") == "")
+
+    check(
+        "CPI/PCE/GDP release window is labelled in PT",
+        release_window_label(RELEASE_WINDOWS[0]) == "05:25-06:30 PT window (CPI / PCE / GDP)",
+        release_window_label(RELEASE_WINDOWS[0]),
+    )
+    check(
+        "FOMC release window is labelled in PT",
+        release_window_label(RELEASE_WINDOWS[1]) == "10:55-11:45 PT window (FOMC)",
+        release_window_label(RELEASE_WINDOWS[1]),
+    )
+
+    entry_line = ScheduledBriefings._format_entry(
+        {"symbol": "AAPL", "quarter": 4, "year": 2026, "hour": "amc"}
+    )
+    check(
+        "Earnings lines carry the PT slot",
+        "Post-Market (~13:00-14:00 PT)" in entry_line,
+        entry_line,
+    )
+
+    # --------------------------------------------------------- market snapshot
+    section("market snapshot")
+
+    tickers = [ticker for _, assets in SNAPSHOT_GROUPS for ticker, _, _ in assets]
+    check("Every requested asset is configured", len(tickers) == 17, f"{len(tickers)} symbols")
+    check("No symbol is listed twice", len(set(tickers)) == len(tickers))
+
+    sample_snapshot = {
+        "BTC-USD": (67000.0, 66000.0),
+        "ETH-USD": (3400.0, 3450.0),
+        "^TNX": (4.23, 4.20),
+        "EURUSD=X": (1.0876, 1.0863),
+        "HYPE32196-USD": (12.34, None),  # no previous close available
+    }
+
+    blocks = ScheduledBriefings._snapshot_blocks(sample_snapshot)
+    body = "\n".join(blocks)
+    check("Snapshot renders a code block", bool(blocks), f"{len(blocks)} block(s)")
+    check(
+        "Every block is fenced",
+        all(block.startswith("```") and block.endswith("```") for block in blocks),
+    )
+    widest = max((len(block) for block in blocks), default=0)
+    check(
+        "Snapshot blocks fit Discord's 1024-char field cap",
+        widest <= 1024,
+        f"widest={widest}",
+    )
+    check("Snapshot uses tree branches", "├" in body and "└" in body)
+    check(
+        "Snapshot lists every group",
+        all(name in body for name, _ in SNAPSHOT_GROUPS),
+        ", ".join(name for name, _ in SNAPSHOT_GROUPS),
+    )
+    check("Crypto is dollar-quoted", "BTC: $67,000.00 | +1.52%" in body)
+    check("A fall in price shows a negative change", "ETH: $3,400.00 | -1.45%" in body)
+    check("The 10Y yield is rendered as a percent", "US 10Y Yield: 4.23% | +0.71%" in body)
+    check("FX is quoted to four decimals", "EUR/USD: 1.0876 | +0.12%" in body)
+    check(
+        "A missing previous close falls back to N/A",
+        "HYPE: $12.34 | N/A" in body,
+        "no crash",
+    )
+    check("Unfetched symbols fall back to N/A", body.count("N/A") >= 20, f"{body.count('N/A')} N/A")
+
+    empty_snapshot_blocks = ScheduledBriefings._snapshot_blocks({})
+    check(
+        "An empty snapshot still renders every group",
+        all(name in "\n".join(empty_snapshot_blocks) for name, _ in SNAPSHOT_GROUPS),
+    )
+
+    with_snapshot = ScheduledBriefings._build_embed(
+        monday, friday, sample, sample_snapshot
+    )
+    field_names = [field.name for field in with_snapshot.fields]
+    check(
+        "Briefing embed carries the snapshot field",
+        any("Market Snapshot" in name for name in field_names),
+        ", ".join(field_names),
+    )
+    oversized = [
+        field.name for field in with_snapshot.fields if len(field.value) > 1024
+    ]
+    check(
+        "No briefing field exceeds the 1024-char cap",
+        not oversized,
+        ", ".join(oversized) if oversized else "all within cap",
+    )
+    check(
+        "Briefing footer states Pacific",
+        "US/Pacific" in (with_snapshot.footer.text or ""),
+        with_snapshot.footer.text,
+    )
+
+    no_earnings = ScheduledBriefings._build_embed(monday, friday, [], sample_snapshot)
+    check(
+        "Snapshot still renders when the week has no earnings",
+        any("Market Snapshot" in field.name for field in no_earnings.fields),
+        "; ".join(field.name for field in no_earnings.fields),
     )
 
     # ------------------------------------------------------------- test posts

@@ -12,11 +12,12 @@ from typing import Any
 
 import discord
 import finnhub
+import yfinance as yf
 from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from utils import resolve_channel, retry_async, run_blocking
+from utils import resolve_channel, retry_async, run_blocking, to_pacific_clock
 
 log = logging.getLogger(__name__)
 
@@ -37,11 +38,99 @@ HIGH_INTEREST_RANK = {ticker: index for index, ticker in enumerate(HIGH_INTEREST
 MAX_PER_DAY = 12
 MAX_TOTAL = 25
 
-TIMING_LABELS = {
-    "bmo": "before open",
-    "amc": "after close",
-    "dmh": "during hours",
+# Reporting slots. The hours are US/Eastern — the clock the exchange runs on —
+# and the Pacific range shown in the label is derived from them, never typed in
+# by hand, so the two can never drift apart.
+TIMING_WINDOWS = {
+    "bmo": ("Pre-Market", 8, 30, 9, 30),
+    "amc": ("Post-Market", 16, 0, 17, 0),
+    "dmh": ("Market Hours", 9, 30, 16, 0),
 }
+
+# The Monday market snapshot. Each entry is (yfinance symbol, display label,
+# value kind); the kind decides how the number is rendered.
+SNAPSHOT_GROUPS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
+    (
+        "Crypto",
+        (
+            ("BTC-USD", "BTC", "usd"),
+            ("ETH-USD", "ETH", "usd"),
+            # Yahoo lists Hyperliquid under a numeric-suffixed symbol; plain
+            # "HYPE-USD" returns no data at all.
+            ("HYPE32196-USD", "HYPE", "usd"),
+            ("XMR-USD", "XMR", "usd"),
+        ),
+    ),
+    (
+        "Equities",
+        (
+            ("SPY", "SP500", "usd"),
+            ("QQQ", "QQQ", "usd"),
+            # URTH (MSCI World, developed markets) rather than VT, so it does
+            # not overlap with the emerging-markets line below.
+            ("URTH", "World", "usd"),
+            ("EEM", "EEM", "usd"),
+        ),
+    ),
+    (
+        "Bonds",
+        (
+            ("HYG", "HYG", "usd"),
+            # ^TNX already quotes the yield in percent: 4.23 means 4.23%.
+            ("^TNX", "US 10Y Yield", "percent"),
+        ),
+    ),
+    (
+        "Commodities",
+        (
+            ("CL=F", "Crude Oil", "usd"),
+            ("GC=F", "Gold", "usd"),
+            ("SI=F", "Silver", "usd"),
+        ),
+    ),
+    (
+        "Currencies",
+        (
+            ("EURUSD=X", "EUR/USD", "rate"),
+            ("JPY=X", "USD/JPY", "rate"),
+            ("AUDUSD=X", "AUD/USD", "rate"),
+            ("CHF=X", "USD/CHF", "rate"),
+        ),
+    ),
+)
+
+# Discord caps a field value at 1024 characters, and a code block cannot be
+# split across two fields, so whole groups are packed into blocks under this.
+SNAPSHOT_FIELD_BUDGET = 980
+
+
+def timing_label(code: str) -> str:
+    """Human-readable reporting slot, e.g. 'Pre-Market (~05:30-06:30 PT)'."""
+    window = TIMING_WINDOWS.get((code or "").lower())
+    if window is None:
+        return ""
+    name, start_hour, start_minute, end_hour, end_minute = window
+    start = to_pacific_clock(start_hour, start_minute)
+    end = to_pacific_clock(end_hour, end_minute)
+    return f"{name} (~{start}-{end} PT)"
+
+
+def _format_snapshot_value(value: float | None, kind: str) -> str:
+    if value is None:
+        return "N/A"
+    if kind == "percent":
+        return f"{value:.2f}%"
+    if kind == "rate":
+        # Majors are quoted to four decimals, but a pair like USD/JPY trades in
+        # the hundreds and is conventionally shown to two.
+        return f"{value:,.4f}" if abs(value) < 50 else f"{value:,.2f}"
+    # Dollar-quoted assets: sub-dollar coins need more precision than indices do.
+    decimals = 2 if abs(value) >= 1 else 6
+    return f"${value:,.{decimals}f}"
+
+
+def _format_snapshot_change(percent: float | None) -> str:
+    return "N/A" if percent is None else f"{percent:+.2f}%"
 
 
 class BriefingNotSent(Exception):
@@ -170,8 +259,23 @@ class ScheduledBriefings(commands.Cog):
             ) from error
 
         try:
+            snapshot = await retry_async(
+                self._fetch_snapshot,
+                attempts=2,
+                base_delay=2.0,
+                label="market snapshot",
+            )
+        except Exception:
+            # The snapshot is context, not the point of the briefing, so a Yahoo
+            # outage must not cost the week's post. Missing quotes render "N/A".
+            log.exception("Market snapshot unavailable; posting the briefing without it")
+            snapshot = {}
+
+        try:
             await channel.send(
-                embed=self._build_embed(monday, friday, calendar, is_test=is_test)
+                embed=self._build_embed(
+                    monday, friday, calendar, snapshot, is_test=is_test
+                )
             )
         except discord.HTTPException as error:
             raise BriefingNotSent(
@@ -200,6 +304,93 @@ class ScheduledBriefings(commands.Cog):
             return []
         return payload.get("earningsCalendar") or []
 
+    # ----------------------------------------------------------- market snapshot
+
+    @classmethod
+    async def _fetch_snapshot(cls) -> dict[str, tuple[float | None, float | None]]:
+        """Latest price and previous close for every tracked asset."""
+        tickers = [ticker for _, assets in SNAPSHOT_GROUPS for ticker, _, _ in assets]
+        return await run_blocking(cls._fetch_snapshot_sync, tickers)
+
+    @staticmethod
+    def _fetch_snapshot_sync(
+        tickers: list[str],
+    ) -> dict[str, tuple[float | None, float | None]]:
+        """One batched yfinance request for all assets, not one call per ticker.
+
+        A request per ticker would mean seventeen round trips; the batched
+        download returns every series in a single frame.
+        """
+        frame = yf.download(
+            tickers=tickers,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,  # raw closes, so the daily change is not skewed by dividends
+            progress=False,
+            threads=True,
+        )
+        if frame is None or getattr(frame, "empty", True) or "Close" not in frame:
+            return {}
+
+        close = frame["Close"]
+        if getattr(close, "columns", None) is None:
+            # yfinance drops the outer column level when there is only one ticker.
+            close = close.to_frame(name=tickers[0])
+
+        quotes: dict[str, tuple[float | None, float | None]] = {}
+        for ticker in tickers:
+            if ticker not in close.columns:
+                quotes[ticker] = (None, None)  # symbol delisted or unavailable
+                continue
+            series = close[ticker].dropna()
+            if series.empty:
+                quotes[ticker] = (None, None)
+                continue
+            latest = float(series.iloc[-1])
+            previous = float(series.iloc[-2]) if len(series) > 1 else None
+            quotes[ticker] = (latest, previous)
+        return quotes
+
+    @staticmethod
+    def _snapshot_blocks(
+        snapshot: dict[str, tuple[float | None, float | None]],
+    ) -> list[str]:
+        """Render the snapshot as one or more code blocks.
+
+        Whole groups are packed into each block, because a code block cannot be
+        split across two embed fields without breaking the fence.
+        """
+        rendered_groups: list[str] = []
+        for group_name, assets in SNAPSHOT_GROUPS:
+            lines = [group_name]
+            for index, (ticker, label, kind) in enumerate(assets):
+                branch = "└" if index == len(assets) - 1 else "├"
+                price, previous = snapshot.get(ticker, (None, None))
+                percent = (
+                    (price - previous) / previous * 100
+                    if price is not None and previous
+                    else None
+                )
+                lines.append(
+                    f"{branch} {label}: {_format_snapshot_value(price, kind)} "
+                    f"| {_format_snapshot_change(percent)}"
+                )
+            rendered_groups.append("\n".join(lines))
+
+        blocks: list[str] = []
+        current: list[str] = []
+        current_length = 0
+        for group in rendered_groups:
+            added = len(group) + (1 if current else 0)
+            if current and current_length + added > SNAPSHOT_FIELD_BUDGET:
+                blocks.append("```\n" + "\n".join(current) + "\n```")
+                current, current_length, added = [], 0, len(group)
+            current.append(group)
+            current_length += added
+        if current:
+            blocks.append("```\n" + "\n".join(current) + "\n```")
+        return blocks
+
     # ---------------------------------------------------------------- rendering
 
     @classmethod
@@ -208,6 +399,7 @@ class ScheduledBriefings(commands.Cog):
         monday: date,
         friday: date,
         entries: list[dict[str, Any]],
+        snapshot: dict[str, tuple[float | None, float | None]] | None = None,
         *,
         is_test: bool = False,
     ) -> discord.Embed:
@@ -233,46 +425,60 @@ class ScheduledBriefings(commands.Cog):
         total = sum(len(day_entries) for day_entries in by_day.values())
         if total == 0:
             embed.description = "No earnings scheduled this week."
-            embed.set_footer(text=f"Source: Finnhub earnings calendar{test_note}")
-            return embed
-
-        watched = sum(
-            1
-            for entry in entries
-            if str(entry.get("symbol") or "").strip().upper() in HIGH_INTEREST_RANK
-        )
-        embed.description = (
-            f"**{total}** companies report Monday–Friday, **{watched}** on the "
-            "high-interest list. ⭐ marks the high-interest names."
-        )
-
-        remaining = MAX_TOTAL
-        for offset in range(5):
-            day = monday + timedelta(days=offset)
-            day_entries = sorted(
-                by_day.get(day.isoformat(), []), key=cls._sort_key
+        else:
+            watched = sum(
+                1
+                for entry in entries
+                if str(entry.get("symbol") or "").strip().upper() in HIGH_INTEREST_RANK
             )
-            if not day_entries:
-                continue
+            embed.description = (
+                f"**{total}** companies report Monday–Friday, **{watched}** on the "
+                "high-interest list. ⭐ marks the high-interest names."
+            )
 
-            take = min(len(day_entries), MAX_PER_DAY, remaining)
-            lines = [cls._format_entry(entry) for entry in day_entries[:take]]
-            hidden = len(day_entries) - take
-            if hidden > 0:
-                lines.append(f"*…and {hidden} more*")
+            remaining = MAX_TOTAL
+            for offset in range(5):
+                day = monday + timedelta(days=offset)
+                day_entries = sorted(
+                    by_day.get(day.isoformat(), []), key=cls._sort_key
+                )
+                if not day_entries:
+                    continue
 
+                take = min(len(day_entries), MAX_PER_DAY, remaining)
+                lines = [cls._format_entry(entry) for entry in day_entries[:take]]
+                hidden = len(day_entries) - take
+                if hidden > 0:
+                    lines.append(f"*…and {hidden} more*")
+
+                embed.add_field(
+                    name=f"{day:%A} · {day:%b} {day.day}",
+                    value="\n".join(lines),
+                    inline=False,
+                )
+
+                remaining -= take
+                if remaining <= 0:
+                    break
+
+        # The snapshot goes last: the earnings detail is the point of the post,
+        # so the week's actual news should be the first thing read.
+        for index, block in enumerate(cls._snapshot_blocks(snapshot or {})):
             embed.add_field(
-                name=f"{day:%A} · {day:%b} {day.day}",
-                value="\n".join(lines),
+                name=(
+                    "\U0001f4ca Market Snapshot (Monday Open)"
+                    if index == 0
+                    else "\U0001f4ca Market Snapshot (continued)"
+                ),
+                value=block,
                 inline=False,
             )
 
-            remaining -= take
-            if remaining <= 0:
-                break
-
         embed.set_footer(
-            text=f"Source: Finnhub earnings calendar · times are US/Eastern{test_note}"
+            text=(
+                "Sources: Finnhub earnings calendar, Yahoo Finance snapshot "
+                f"· times are US/Pacific{test_note}"
+            )
         )
         return embed
 
@@ -296,7 +502,7 @@ class ScheduledBriefings(commands.Cog):
         estimate = entry.get("epsEstimate")
         eps = f"EPS est {estimate:,.2f}" if isinstance(estimate, (int, float)) else ""
 
-        timing = TIMING_LABELS.get(str(entry.get("hour") or "").lower(), "")
+        timing = timing_label(str(entry.get("hour") or ""))
 
         details = " · ".join(part for part in (quarter, eps, timing) if part)
         return f"{star}**{symbol}**" + (f" — {details}" if details else "")

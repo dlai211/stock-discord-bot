@@ -42,12 +42,16 @@ TARGET_CHANNEL_ID: int | None = int(_raw_channel_id) if _raw_channel_id.isdigit(
 try:
     from zoneinfo import ZoneInfo
 
+    # Schedules fire on the Eastern clock, because that is what the exchanges and
+    # the release calendar use. Display converts to Pacific for the reader.
     EASTERN: tzinfo = ZoneInfo("America/New_York")
+    PACIFIC: tzinfo = ZoneInfo("America/Los_Angeles")
     TIMEZONE_BACKEND = "zoneinfo"
 except Exception:  # pragma: no cover - only on a machine with no tz database
     import pytz
 
     EASTERN = pytz.timezone("America/New_York")
+    PACIFIC = pytz.timezone("America/Los_Angeles")
     TIMEZONE_BACKEND = "pytz"
 
 REQUIRED_VARIABLES = {

@@ -25,6 +25,7 @@ from utils import (
     retry_async,
     run_blocking,
     save_json,
+    to_pacific_clock,
 )
 
 log = logging.getLogger(__name__)
@@ -49,16 +50,35 @@ MONITORED_SERIES: dict[str, dict[str, Any]] = {
     },
 }
 
-# Minutes past midnight US/Eastern. These label an alert with the window it
-# landed in; the on-disk cache — not the window — is what prevents duplicates.
+# Release windows, as (start hour, start minute, end hour, end minute, name) on
+# the US/Eastern clock — the clock the release schedule runs on. These label an
+# alert with the window it landed in; the on-disk cache, not the window, is what
+# prevents duplicate posts.
+#
+# The label shown to readers is derived in Pacific rather than typed in, so the
+# two can never drift apart.
 #
 # Only the 08:30 window can currently produce an alert, because none of the
 # three monitored series is a rate decision. To make the FOMC window functional,
 # add DFEDTARU (fed funds target range, upper limit) to MONITORED_SERIES.
 RELEASE_WINDOWS = (
-    (8 * 60 + 25, 9 * 60 + 30, "08:30 ET window (CPI / PCE / GDP)"),
-    (13 * 60 + 55, 14 * 60 + 45, "14:00 ET window (FOMC)"),
+    (8, 25, 9, 30, "CPI / PCE / GDP"),
+    (13, 55, 14, 45, "FOMC"),
 )
+
+
+def window_bounds(window: tuple[int, int, int, int, str]) -> tuple[int, int]:
+    """The window as (start, end) minutes past midnight US/Eastern."""
+    start_hour, start_minute, end_hour, end_minute, _ = window
+    return start_hour * 60 + start_minute, end_hour * 60 + end_minute
+
+
+def release_window_label(window: tuple[int, int, int, int, str]) -> str:
+    """Human-readable window, e.g. '05:25-06:30 PT window (CPI / PCE / GDP)'."""
+    start_hour, start_minute, end_hour, end_minute, name = window
+    start = to_pacific_clock(start_hour, start_minute)
+    end = to_pacific_clock(end_hour, end_minute)
+    return f"{start}-{end} PT window ({name})"
 
 STATE_PATH = config.PROJECT_ROOT / "state" / "macro_state.json"
 
@@ -290,9 +310,10 @@ class MacroAlerts(commands.Cog):
         """Label for the release window we are currently inside, if any."""
         now = datetime.now(config.EASTERN)
         minute_of_day = now.hour * 60 + now.minute
-        for start, end, label in RELEASE_WINDOWS:
+        for window in RELEASE_WINDOWS:
+            start, end = window_bounds(window)
             if start <= minute_of_day <= end:
-                return label
+                return release_window_label(window)
         return None
 
     @staticmethod

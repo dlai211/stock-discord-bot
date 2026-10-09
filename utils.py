@@ -9,10 +9,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 import discord
+
+import config
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +76,23 @@ def format_signed(value: Any, decimals: int = 2, suffix: str = "") -> str:
     if number is None:
         return "N/A"
     return f"{number:+,.{decimals}f}{suffix}"
+
+
+def to_pacific_clock(hour: int, minute: int, reference: date | None = None) -> str:
+    """Render a US/Eastern time of day as a US/Pacific clock string, e.g. '05:30'.
+
+    Times in this project are defined on the Eastern clock because that is what
+    the exchanges and the release schedule use; this converts for display. The
+    conversion goes through the timezone database against a real date rather
+    than subtracting a fixed three hours, so the correct standard or daylight
+    offset is applied and the EST/EDT and PST/PDT transitions are handled for
+    us.
+    """
+    anchor_day = reference or datetime.now(config.PACIFIC).date()
+    eastern = datetime.combine(
+        anchor_day, dtime(hour=hour, minute=minute), tzinfo=config.EASTERN
+    )
+    return f"{eastern.astimezone(config.PACIFIC):%H:%M}"
 
 
 async def run_blocking(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
