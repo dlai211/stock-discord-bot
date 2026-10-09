@@ -12,6 +12,7 @@ from typing import Any
 
 import discord
 import finnhub
+from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
@@ -43,6 +44,10 @@ TIMING_LABELS = {
 }
 
 
+class BriefingNotSent(Exception):
+    """The briefing could not be produced. The message is safe to show a user."""
+
+
 class ScheduledBriefings(commands.Cog):
     """Posts a look-ahead at the week's earnings every Monday morning."""
 
@@ -59,7 +64,9 @@ class ScheduledBriefings(commands.Cog):
             return
 
         try:
-            await self._post_briefing(today)
+            await self._post_briefing(today, today + timedelta(days=4))
+        except BriefingNotSent as error:
+            log.error("Weekly briefing not sent: %s", error)
         except Exception:
             # An exception escaping a tasks.loop stops it permanently, so this
             # catch is what keeps next Monday working.
@@ -85,19 +92,67 @@ class ScheduledBriefings(commands.Cog):
     async def cog_unload(self) -> None:
         self.weekly_briefing.cancel()
 
-    # ------------------------------------------------------------------ posting
+    # ----------------------------------------------------------------- commands
 
-    async def _post_briefing(self, today: date) -> None:
-        monday = today - timedelta(days=today.weekday())
-        friday = monday + timedelta(days=4)
+    @app_commands.command(
+        name="test_briefing",
+        description="Send the weekly earnings briefing now, without waiting for Monday.",
+    )
+    async def test_briefing(self, interaction: discord.Interaction) -> None:
+        # Ephemeral so only the caller sees the confirmation; the briefing itself
+        # goes to the target channel like the real one.
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
-        channel = await resolve_channel(self.bot, config.TARGET_CHANNEL_ID)
-        if channel is None:
-            log.error(
-                "TARGET_CHANNEL_ID (%s) could not be resolved; skipping this week's briefing",
-                config.TARGET_CHANNEL_ID,
+        monday, friday = self._briefing_week(datetime.now(config.EASTERN).date())
+        try:
+            await self._post_briefing(monday, friday, is_test=True)
+        except BriefingNotSent as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except Exception:
+            log.exception("Test briefing failed")
+            await interaction.followup.send(
+                "Something went wrong building the briefing. Check the bot logs.",
+                ephemeral=True,
             )
             return
+
+        await interaction.followup.send(
+            f"Posted a test briefing for {monday:%b} {monday.day} – "
+            f"{friday:%b} {friday.day} to <#{config.TARGET_CHANNEL_ID}>.",
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------ posting
+
+    @staticmethod
+    def _briefing_week(today: date) -> tuple[date, date]:
+        """The Monday–Friday window to report on.
+
+        Normally the week containing `today`. On a weekend that week is already
+        over, so roll forward to the coming week — otherwise a manual test run
+        on a Saturday could only ever report "no earnings".
+        """
+        monday = today - timedelta(days=today.weekday())
+        if today.weekday() >= 5:
+            monday += timedelta(days=7)
+        return monday, monday + timedelta(days=4)
+
+    async def _post_briefing(
+        self, monday: date, friday: date, *, is_test: bool = False
+    ) -> None:
+        """Build and post the briefing, raising BriefingNotSent if it cannot go out.
+
+        The two callers want different failure handling — the scheduled loop logs
+        and moves on, the slash command tells the user what went wrong — so every
+        failure surfaces as one exception type with a user-safe message.
+        """
+        channel = await resolve_channel(self.bot, config.TARGET_CHANNEL_ID)
+        if channel is None:
+            raise BriefingNotSent(
+                f"Couldn't resolve channel `{config.TARGET_CHANNEL_ID}`. Check "
+                "`TARGET_CHANNEL_ID`, and that the bot can see that channel."
+            )
 
         try:
             calendar = await retry_async(
@@ -108,19 +163,27 @@ class ScheduledBriefings(commands.Cog):
                 base_delay=5.0,
                 label="Finnhub earnings calendar",
             )
-        except Exception:
-            # Deliberately not re-raised: a provider outage should cost one
-            # week's briefing, not the whole schedule.
-            log.exception("Could not fetch the earnings calendar; skipping this week")
-            return
+        except Exception as error:
+            raise BriefingNotSent(
+                "Couldn't reach the Finnhub earnings calendar. Check the bot logs "
+                "for the underlying error."
+            ) from error
 
         try:
-            await channel.send(embed=self._build_embed(monday, friday, calendar))
-            log.info("Posted the weekly earnings briefing for %s", monday.isoformat())
-        except discord.HTTPException:
-            log.exception(
-                "Could not post the briefing to channel %s", config.TARGET_CHANNEL_ID
+            await channel.send(
+                embed=self._build_embed(monday, friday, calendar, is_test=is_test)
             )
+        except discord.HTTPException as error:
+            raise BriefingNotSent(
+                "Discord rejected the message. Check the bot has **Send Messages** "
+                "and **Embed Links** in that channel."
+            ) from error
+
+        log.info(
+            "%s the weekly earnings briefing for %s",
+            "Test-posted" if is_test else "Posted",
+            monday.isoformat(),
+        )
 
     @staticmethod
     async def _fetch_calendar(monday: date, friday: date) -> list[dict[str, Any]]:
@@ -141,8 +204,14 @@ class ScheduledBriefings(commands.Cog):
 
     @classmethod
     def _build_embed(
-        cls, monday: date, friday: date, entries: list[dict[str, Any]]
+        cls,
+        monday: date,
+        friday: date,
+        entries: list[dict[str, Any]],
+        *,
+        is_test: bool = False,
     ) -> discord.Embed:
+        test_note = " · TEST POST" if is_test else ""
         by_day: dict[str, list[dict[str, Any]]] = {}
         for entry in entries:
             day = entry.get("date")
@@ -153,17 +222,18 @@ class ScheduledBriefings(commands.Cog):
 
         embed = discord.Embed(
             title=(
-                f"\U0001f4c5 Week Ahead: Earnings — "
+                f"{'[TEST] ' if is_test else ''}\U0001f4c5 Week Ahead: Earnings — "
                 f"{monday:%b} {monday.day} to {friday:%b} {friday.day}, {friday.year}"
             ),
-            color=discord.Color(0x5865F2),
+            # Amber marks a test post so it is never mistaken for the real Monday run.
+            color=discord.Color(0xF1C40F) if is_test else discord.Color(0x5865F2),
             timestamp=datetime.now(timezone.utc),
         )
 
         total = sum(len(day_entries) for day_entries in by_day.values())
         if total == 0:
             embed.description = "No earnings scheduled this week."
-            embed.set_footer(text="Source: Finnhub earnings calendar")
+            embed.set_footer(text=f"Source: Finnhub earnings calendar{test_note}")
             return embed
 
         watched = sum(
@@ -202,7 +272,7 @@ class ScheduledBriefings(commands.Cog):
                 break
 
         embed.set_footer(
-            text="Source: Finnhub earnings calendar · times are US/Eastern"
+            text=f"Source: Finnhub earnings calendar · times are US/Eastern{test_note}"
         )
         return embed
 

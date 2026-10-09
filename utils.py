@@ -7,7 +7,9 @@ keeps blocking network calls off the event loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 import discord
@@ -156,3 +158,37 @@ def _to_float(value: Any) -> float | None:
     if number != number:  # noqa: PLR0124 - NaN check without importing math
         return None
     return number
+
+
+def load_json(path: Path, default: T) -> T:
+    """Read a JSON file, falling back to `default` when it is missing or corrupt.
+
+    A bot that cannot start because a cache file got truncated is worse than one
+    that starts empty, so every failure here is non-fatal.
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+    except (OSError, json.JSONDecodeError):
+        log.warning("Could not read %s; using the default", path, exc_info=True)
+        return default
+
+
+def save_json(path: Path, payload: Any) -> bool:
+    """Write JSON atomically, returning False if it could not be saved.
+
+    The data goes to a temporary file first and is then moved into place, so an
+    interrupted write can never leave a half-written file behind.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        temporary.replace(path)
+        return True
+    except OSError:
+        log.warning("Could not write %s", path, exc_info=True)
+        return False

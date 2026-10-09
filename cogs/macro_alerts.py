@@ -7,12 +7,12 @@ safe: the bot only ever announces a period it has not announced before.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from fredapi import Fred
 
@@ -20,9 +20,11 @@ import config
 from utils import (
     format_number,
     format_signed,
+    load_json,
     resolve_channel,
     retry_async,
     run_blocking,
+    save_json,
 )
 
 log = logging.getLogger(__name__)
@@ -63,33 +65,17 @@ STATE_PATH = config.PROJECT_ROOT / "state" / "macro_state.json"
 
 def _load_state() -> dict[str, str]:
     """Read the seen-observation-date cache, tolerating a missing or corrupt file."""
-    try:
-        with STATE_PATH.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except FileNotFoundError:
-        return {}
-    except (OSError, json.JSONDecodeError):
-        log.warning(
-            "Could not read %s; starting from an empty cache", STATE_PATH, exc_info=True
-        )
-        return {}
-
+    data = load_json(STATE_PATH, {})
     if not isinstance(data, dict):
-        log.warning("%s did not contain an object; starting from an empty cache", STATE_PATH)
+        log.warning(
+            "%s did not contain an object; starting from an empty cache", STATE_PATH
+        )
         return {}
     return {str(key): str(value) for key, value in data.items()}
 
 
 def _save_state(state: dict[str, str]) -> None:
-    """Write the cache atomically so a crash mid-write cannot corrupt it."""
-    try:
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary = STATE_PATH.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2, sort_keys=True)
-        temporary.replace(STATE_PATH)
-    except OSError:
-        log.warning("Could not write %s", STATE_PATH, exc_info=True)
+    save_json(STATE_PATH, state)
 
 
 class MacroAlerts(commands.Cog):
@@ -123,6 +109,86 @@ class MacroAlerts(commands.Cog):
             await self.bot.wait_until_ready()
         except RuntimeError:
             log.debug("Discord is not connected yet; the poll loop will wait for its first interval")
+
+    # ----------------------------------------------------------------- commands
+
+    @app_commands.command(
+        name="test_macro_alert",
+        description="Post a sample release alert for one series, without waiting for a real print.",
+    )
+    @app_commands.describe(series="Which series to post a sample alert for")
+    @app_commands.choices(
+        series=[
+            app_commands.Choice(name="CPI — CPIAUCSL", value="CPIAUCSL"),
+            app_commands.Choice(name="Core PCE — PCEPILFE", value="PCEPILFE"),
+            app_commands.Choice(name="Real GDP — GDPC1", value="GDPC1"),
+        ]
+    )
+    async def test_macro_alert(
+        self, interaction: discord.Interaction, series: app_commands.Choice[str]
+    ) -> None:
+        if self._fred is None:
+            await interaction.response.send_message(
+                "`FRED_API_KEY` isn't set, so there's nothing to fetch. Add it to "
+                "`.env` and restart the bot.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        series_id = series.value
+
+        channel = await resolve_channel(self.bot, config.TARGET_CHANNEL_ID)
+        if channel is None:
+            await interaction.followup.send(
+                f"Couldn't resolve channel `{config.TARGET_CHANNEL_ID}`.", ephemeral=True
+            )
+            return
+
+        try:
+            observation = await retry_async(
+                self._fetch_latest,
+                series_id,
+                attempts=3,
+                base_delay=3.0,
+                label=f"FRED:{series_id}",
+            )
+        except Exception:
+            log.exception("Test alert could not read %s", series_id)
+            await interaction.followup.send(
+                f"Couldn't read `{series_id}` from FRED. Check the bot logs.",
+                ephemeral=True,
+            )
+            return
+
+        if observation is None:
+            await interaction.followup.send(
+                f"FRED returned no usable observations for `{series_id}`.", ephemeral=True
+            )
+            return
+
+        try:
+            await channel.send(
+                embed=self._alert_embed(
+                    series_id, observation, self._active_window(), is_test=True
+                )
+            )
+        except discord.HTTPException:
+            log.exception("Test alert could not be posted to the channel")
+            await interaction.followup.send(
+                "Discord rejected the message. Check the bot has **Send Messages** "
+                "and **Embed Links** in that channel.",
+                ephemeral=True,
+            )
+            return
+
+        # self._state is deliberately left alone here. Recording the period as
+        # seen would suppress the real alert when that release actually lands.
+        await interaction.followup.send(
+            f"Posted a test alert for `{series_id}` to <#{config.TARGET_CHANNEL_ID}>. "
+            "The release cache was left untouched, so the real alert will still fire.",
+            ephemeral=True,
+        )
 
     # ------------------------------------------------------------------ polling
 
@@ -243,6 +309,8 @@ class MacroAlerts(commands.Cog):
         series_id: str,
         observation: dict[str, Any],
         window: str | None,
+        *,
+        is_test: bool = False,
     ) -> discord.Embed:
         meta = MONITORED_SERIES[series_id]
         value = observation["value"]
@@ -250,8 +318,9 @@ class MacroAlerts(commands.Cog):
         year_ago = observation["year_ago"]
 
         embed = discord.Embed(
-            title=f"\U0001f4ca New data: {meta['label']}",
-            color=discord.Color(0xF1C40F),
+            title=f"{'[TEST] ' if is_test else ''}\U0001f4ca New data: {meta['label']}",
+            # Grey marks a test post; real alerts stay amber.
+            color=discord.Color(0x95A5A6) if is_test else discord.Color(0xF1C40F),
             timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="Release", value=meta["category"], inline=False)
@@ -282,13 +351,14 @@ class MacroAlerts(commands.Cog):
                 inline=False,
             )
 
-        embed.set_footer(
-            text=(
-                f"Source: FRED · {window}"
-                if window
-                else "Source: FRED · outside a standard release window"
-            )
+        footer = (
+            f"Source: FRED · {window}"
+            if window
+            else "Source: FRED · outside a standard release window"
         )
+        if is_test:
+            footer += " · TEST POST, release cache unchanged"
+        embed.set_footer(text=footer)
         return embed
 
 
