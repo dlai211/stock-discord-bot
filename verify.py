@@ -16,6 +16,7 @@ import sys
 from datetime import date, datetime, timedelta
 
 import discord
+import pandas as pd
 from discord.ext import commands, tasks
 
 import bot as bot_module
@@ -97,7 +98,15 @@ async def main() -> int:
 
     slash_commands = sorted(command.qualified_name for command in client.tree.walk_commands())
     print(f"slash commands: {', '.join(slash_commands) if slash_commands else 'none'}")
-    for expected in ("stock", "macro"):
+    for expected in (
+        "stock",
+        "macro",
+        "test_briefing",
+        "test_macro_alert",
+        "track_earnings",
+        "untrack_earnings",
+        "list_earnings",
+    ):
         check(f"/{expected} registered", expected in slash_commands)
 
     # --------------------------------------------------------- background tasks
@@ -132,6 +141,19 @@ async def main() -> int:
     if poller is not None:
         check("macro poller interval set", poller.minutes > 0, f"every {poller.minutes} min")
 
+    earnings_check = next((loop for name, loop in loops if name == "daily_check"), None)
+    if earnings_check is None:
+        check("daily_check loop present", False)
+    elif not earnings_check.time:
+        check("daily_check runs at a fixed time", False, f"time={earnings_check.time}")
+    else:
+        earnings_time = list(earnings_check.time)[0]
+        check(
+            "daily_check scheduled for 17:30 US/Eastern",
+            (earnings_time.hour, earnings_time.minute) == (17, 30),
+            f"{earnings_time.hour:02d}:{earnings_time.minute:02d} tz={earnings_time.tzinfo}",
+        )
+
     # Loops started during cog_load are still pending; unload the cogs so their
     # cog_unload hooks cancel them, otherwise asyncio complains on exit.
     for name in list(client.cogs):
@@ -141,7 +163,9 @@ async def main() -> int:
     # --------------------------------------------------------------- rendering
     section("embed rendering (synthetic data, no network)")
 
+    from cogs.earnings_tracker import EarningsTracker
     from cogs.macro_alerts import MONITORED_SERIES, MacroAlerts
+    from cogs.market_commands import MarketCommands
     from cogs.scheduled_briefings import ScheduledBriefings
 
     check(
@@ -210,6 +234,125 @@ async def main() -> int:
     for periods, expected in ((4, "Q2 2026"), (12, "June 2026")):
         label = MacroAlerts._period_label(date(2026, 6, 30), periods)
         check(f"Period label for {periods}/yr", label == expected, label)
+
+    # ------------------------------------------------------------- CPI maths
+    section("CPI year-over-year (synthetic series)")
+
+    index = pd.date_range("2025-09-01", periods=13, freq="MS")
+    rising = pd.Series([300.0 + offset for offset in range(13)], index=index)
+    cpi = MarketCommands._cpi_year_over_year(rising)
+
+    check(
+        "CPI YoY computes the right rate",
+        cpi is not None and round(cpi["yoy_percent"], 6) == 4.0,
+        f"{cpi['yoy_percent']:.4f}% from 300 -> 312" if cpi else "returned None",
+    )
+    if cpi is not None:
+        check(
+            "CPI YoY uses exactly 13 observations",
+            cpi["observations"] == 13,
+            str(cpi["observations"]),
+        )
+        check(
+            "CPI YoY compares the two endpoints",
+            (cpi["year_ago_date"], cpi["latest_date"])
+            == (date(2025, 9, 1), date(2026, 9, 1)),
+            f"{cpi['year_ago_date']} -> {cpi['latest_date']}",
+        )
+    check(
+        "CPI YoY refuses a window shorter than 13",
+        MarketCommands._cpi_year_over_year(rising.tail(6)) is None,
+    )
+    check(
+        "CPI YoY handles a flat series",
+        MarketCommands._cpi_year_over_year(
+            pd.Series([100.0] * 13, index=index)
+        )["yoy_percent"]
+        == 0.0,
+    )
+
+    # ------------------------------------------------------- briefing windows
+    section("briefing week selection")
+
+    midweek = ScheduledBriefings._briefing_week(date(2026, 10, 8))  # a Thursday
+    check(
+        "Midweek stays in the current week",
+        midweek == (date(2026, 10, 5), date(2026, 10, 9)),
+        f"{midweek[0]} -> {midweek[1]}",
+    )
+    weekend = ScheduledBriefings._briefing_week(date(2026, 10, 10))  # a Saturday
+    check(
+        "Weekend rolls forward to the coming week",
+        weekend == (date(2026, 10, 12), date(2026, 10, 16)),
+        f"{weekend[0]} -> {weekend[1]}",
+    )
+
+    # ------------------------------------------------------------- test posts
+    section("test-post labelling")
+
+    test_briefing = ScheduledBriefings._build_embed(monday, friday, sample, is_test=True)
+    check("Briefing test post is labelled", "[TEST]" in test_briefing.title)
+    check(
+        "Briefing test post says so in the footer",
+        "TEST POST" in (test_briefing.footer.text or ""),
+    )
+
+    alert_observation = {
+        "date": date(2026, 9, 1),
+        "value": 325.4,
+        "previous": 324.1,
+        "year_ago": 315.2,
+    }
+    test_alert = MacroAlerts._alert_embed("CPIAUCSL", alert_observation, None, is_test=True)
+    check("Alert test post is labelled", "[TEST]" in test_alert.title)
+    check(
+        "Alert test post warns the cache is unchanged",
+        "cache unchanged" in (test_alert.footer.text or ""),
+    )
+    check(
+        "Test post is visually distinct from a real alert",
+        test_alert.color.value != MacroAlerts._alert_embed(
+            "CPIAUCSL", alert_observation, None
+        ).color.value,
+    )
+
+    # --------------------------------------------------------- earnings result
+    section("earnings result embed")
+
+    beat = EarningsTracker._result_embed(
+        "AAPL",
+        {
+            "symbol": "AAPL",
+            "quarter": 4,
+            "year": 2026,
+            "hour": "amc",
+            "epsActual": 1.85,
+            "epsEstimate": 1.60,
+            "revenueActual": 94_000_000_000,
+            "revenueEstimate": 92_000_000_000,
+        },
+        date(2026, 10, 30),
+    )
+    check("Earnings result embed builds", len(beat.fields) >= 4, f"{len(beat.fields)} field(s)")
+    check("A beat is coloured green", beat.color.value == 0x2ECC71, hex(beat.color.value))
+    check(
+        "Earnings result reads revenue as a compact number",
+        any("B" in field.value for field in beat.fields),
+    )
+
+    miss = EarningsTracker._result_embed(
+        "MSFT",
+        {"symbol": "MSFT", "hour": "bmo", "epsActual": 1.10, "epsEstimate": 1.50},
+        date(2026, 10, 30),
+    )
+    check("A miss is coloured red", miss.color.value == 0xE74C3C, hex(miss.color.value))
+    check(
+        "An entry with no consensus still renders",
+        EarningsTracker._result_embed(
+            "ZZZZ", {"symbol": "ZZZZ", "epsActual": 0.5}, date(2026, 10, 30)
+        )
+        is not None,
+    )
 
     # ----------------------------------------------------------------- summary
     section("summary")

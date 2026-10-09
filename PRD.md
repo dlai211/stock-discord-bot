@@ -28,7 +28,7 @@ its own exceptions so a single failure can never kill the schedule permanently.
 stock-discord-bot/
 ├── bot.py                        # Entry point: builds the Bot, loads cogs, syncs the command tree
 ├── config.py                     # The only module that reads .env
-├── utils.py                      # Number formatting + async/retry helpers
+├── utils.py                      # Formatting, async/retry, atomic JSON helpers
 ├── verify.py                     # Offline smoke test: loads every cog without connecting
 ├── requirements.txt
 ├── Procfile                      # Hosting entry point (worker: python bot.py)
@@ -38,10 +38,13 @@ stock-discord-bot/
 ├── cogs/
 │   ├── __init__.py
 │   ├── market_commands.py        # /stock, /macro
-│   ├── scheduled_briefings.py    # Monday 08:00 ET earnings briefing
-│   └── macro_alerts.py           # FRED release watcher
+│   ├── scheduled_briefings.py    # Monday 08:00 ET briefing, /test_briefing
+│   ├── macro_alerts.py           # FRED release watcher, /test_macro_alert
+│   └── earnings_tracker.py       # /track_earnings watch list, daily 17:30 ET check
 └── state/                        # Runtime cache, created on first run (gitignored)
-    └── macro_state.json
+    ├── macro_state.json          # Newest announced observation per FRED series
+    ├── tracked_earnings.json     # The earnings watch list
+    └── earnings_notified.json    # Earnings alerts already sent, to dedupe
 ```
 
 ### Request flow
@@ -53,6 +56,11 @@ Discord ──► bot.py (setup_hook loads cogs, syncs tree)
               │                               /macro ──► fredapi  ──► FRED
               │
               ├── cogs/scheduled_briefings.py tasks.loop ──► finnhub ──► Finnhub
+              │
+              ├── cogs/earnings_tracker.py    tasks.loop ──► finnhub ──► Finnhub
+              │                                     │
+              │                                     ├── state/tracked_earnings.json
+              │                                     └── state/earnings_notified.json
               │
               └── cogs/macro_alerts.py        tasks.loop ──► fredapi ──► FRED
                                                      │
@@ -135,6 +143,13 @@ Pulls three FRED series and computes the 10Y–2Y spread.
 Spread is reported in **basis points** (`(DGS10 − DGS2) × 100`) and flagged
 **inverted** when negative. Per-series latest observation dates are shown.
 
+The embed also carries a **headline CPI inflation rate**: the year-over-year
+change in `CPIAUCSL`, computed across the latest 13 monthly observations
+(`(latest − 12 months prior) / 12 months prior`). It is displayed with both
+endpoints — the period and index level of each — so the window is never
+ambiguous. If FRED has not published a full 13-month window, the field says so
+rather than showing a partial calculation.
+
 ### 5.3 Weekly Earnings Briefing — `cogs/scheduled_briefings.py`
 
 - **Schedule:** every Monday at **08:00 US/Eastern** (`tasks.loop(time=...)` with
@@ -162,6 +177,71 @@ Spread is reported in **basis points** (`(DGS10 − DGS2) × 100`) and flagged
 
 Release windows are tracked as labels (08:25–09:30 ET and 13:55–14:45 ET) and
 recorded in the alert footer.
+
+### 5.5 Test commands
+
+Two commands exercise the scheduled paths on demand, so neither has to wait for
+a Monday or a real data release.
+
+| Command | Cog | Effect |
+|---|---|---|
+| `/test_briefing` | `scheduled_briefings` | Runs the real briefing generator and posts it to `TARGET_CHANNEL_ID`. |
+| `/test_macro_alert <series>` | `macro_alerts` | Pulls the latest real observation for the chosen series and posts it as an alert. |
+
+Both share the production code path rather than a copy of it, so a passing test
+means the real post will work.
+
+**Test posts are unambiguous.** The title is prefixed `[TEST]`, the embed colour
+differs from a real post (amber→grey for alerts, blue→amber for briefings), and
+the footer says `TEST POST`.
+
+**The release cache is never touched by a test.** `state/macro_state.json`
+tracks which periods have already been announced. If `/test_macro_alert` wrote
+to it, the *real* alert for that period would later be silently suppressed.
+The command deliberately skips the write, so testing is always safe to repeat.
+
+`/test_macro_alert` still reads live data, so it needs FRED to be reachable; if
+it is not, the command reports the failure instead of posting.
+
+`/test_briefing` reports on the current week, or the coming week when run on a
+Saturday or Sunday — otherwise a weekend test could only ever answer "no
+earnings".
+
+### 5.6 Earnings tracker — `cogs/earnings_tracker.py`
+
+A persistent watch list of tickers whose results are announced as they land.
+
+| Command | Effect |
+|---|---|
+| `/track_earnings <ticker>` | Verifies the symbol against Finnhub, then adds it to `state/tracked_earnings.json`. |
+| `/untrack_earnings <ticker>` | Removes it. |
+| `/list_earnings` | Shows the watch list. |
+
+All three reply ephemerally so they don't clutter the channel.
+
+**Symbol validation** uses Finnhub's `/search` endpoint with an *exact* symbol
+match. Search is fuzzy, so accepting the top result would happily track the
+wrong company after a typo.
+
+**The daily check** runs at **17:30 US/Eastern**. It makes one Finnhub call for
+the day's whole earnings calendar and filters it locally, rather than one call
+per tracked ticker. For each match it posts an embed with actual vs consensus
+EPS, the surprise in dollars and percent, and revenue where Finnhub provides it.
+The embed is green on a beat, red on a miss.
+
+**Tracked tickers persist until removed.** Companies report roughly quarterly,
+so a watch list that emptied itself after each report would be useless.
+
+**Both commands take whole embeds, not raw strings.** An entry missing its
+consensus estimate still renders — the surprise line reads `N/A` rather than
+failing.
+
+> **Known gap.** Because this runs once a day, a company that reports after the
+> close and whose actual EPS is not on Finnhub by 17:30 is logged and skipped —
+> there is no second check that day. To close it, add a second time to the
+> loop's `time=` argument (it accepts a list), for example 08:00 ET the
+> following morning. See the changelog entry for why this is not enabled by
+> default.
 
 ---
 
@@ -268,6 +348,10 @@ always-on / no-sleep option if that matters to you.
 | `/stock` says data unavailable | Yahoo Finance rate limit | Wait a minute; the command already retries once |
 | Briefings never appear | Bot lacks Send Messages / Embed Links | Fix channel permissions |
 | Bot disconnects periodically | Blocking call on the event loop | Ensure new code uses `utils.run_blocking()` |
+| `/track_earnings` rejects a real ticker | Finnhub's search has no *exact* match for it | Use the symbol exactly as Finnhub lists it (e.g. `BRK.B`) |
+| Earnings alerts never arrive | Watch list is empty, or the company's actual EPS was not on Finnhub at 17:30 | Check `/list_earnings`; see the known gap in §5.6 |
+| A `[TEST]` post appeared in the channel | Someone ran a test command | Expected — both test commands are open to everyone in the server |
+| `/macro` shows "has not published a full 13-month window" | `CPIAUCSL` is short (early in a series' life, or after an outage) | Nothing to fix; it resolves as FRED publishes |
 
 ---
 
@@ -487,7 +571,85 @@ always-on / no-sleep option if that matters to you.
 | Byte-compile | Clean |
 | Offline check suite | 24/24 |
 
-**Not verified by design:** the bot was never connected to Discord. The user
-chose offline verification, so login, live slash-command sync, real provider
-responses, and the scheduled posts have not been exercised against the live
-services. Run `venv\Scripts\python.exe bot.py` when ready to confirm those.
+**Not verified by design:** at the time of this phase the bot had not been
+connected to Discord. The user chose offline verification, so login, live
+slash-command sync, real provider responses, and the scheduled posts had not
+been exercised against the live services. (Superseded — see the entry below.)
+
+### 2026-10-08 17:02 PT — Enhancements: CPI inflation, test commands, earnings tracker
+
+**Correction to the Phase 5 note above.** The bot has since been run live. The
+state cache at `state/macro_state.json` contains real observation dates for
+`CPIAUCSL`, `GDPC1` and `PCEPILFE` — a file only `_check_for_releases()` writes,
+and only after `resolve_channel()` has returned a channel. Discord login,
+channel resolution and a live FRED round trip are therefore all confirmed
+working, and the first-run seeding behaved exactly as designed by recording the
+current periods without announcing them.
+
+**Added**
+- `/macro` now reports **headline CPI inflation** — the year-over-year change in
+  `CPIAUCSL` across the latest 13 monthly observations, shown with both
+  endpoints (period and index level). See §5.2.
+- `/test_briefing` — runs the real briefing generator and posts it now. See §5.5.
+- `/test_macro_alert <series>` — posts a live-data alert for `CPIAUCSL`,
+  `PCEPILFE` or `GDPC1` on demand. See §5.5.
+- `cogs/earnings_tracker.py` — a persistent earnings watch list with
+  `/track_earnings`, `/untrack_earnings`, `/list_earnings` and a daily 17:30 ET
+  result check. See §5.6.
+- `utils.load_json()` / `utils.save_json()` — shared atomic JSON I/O.
+
+**Modified**
+- `utils.py` — added the JSON helpers; `save_json` writes to a `.tmp` file and
+  moves it into place, and both helpers never raise.
+- `cogs/macro_alerts.py` — `_load_state` / `_save_state` now delegate to the
+  shared helpers, removing a duplicate atomic-write implementation.
+- `cogs/scheduled_briefings.py` — `_post_briefing()` now takes an explicit
+  Monday–Friday window and raises `BriefingNotSent` (with a user-safe message)
+  instead of returning silently. The scheduled loop and `/test_briefing` call
+  the same function, so the test exercises production code rather than a copy.
+  Added `_briefing_week()`.
+- `verify.py` — grown from 24 to **48 checks**.
+
+**Decisions taken with the user**
+- The two test commands are **unrestricted** — any member who can see the
+  channel can run them and produce a `[TEST]` post. The alternative (gating on
+  "Manage Server") was offered and declined.
+- The earnings check runs **once daily at 17:30 ET**, not twice. The trade-off —
+  after-close prints published later than 17:30 are missed — was shown in
+  plain language and accepted. It is recorded as a known gap in §5.6 along with
+  the one-line change to close it.
+- `/test_macro_alert` uses **real FRED data** and is labelled `[TEST]`, rather
+  than fabricated numbers, so it proves the whole pipeline.
+
+**Verified**
+- `python verify.py` — **48/48 checks passed**, exit 0. Now covers all seven
+  slash commands, all three background loops, both test-post variants and the
+  earnings result embed.
+- New checks include a genuine unit test of the CPI arithmetic: a synthetic
+  13-point series rising 300 → 312 must yield exactly 4.00% year-over-year,
+  must report 13 observations, must compare the correct two endpoints, must
+  return `None` for a 6-point window, and must return 0.00% for a flat series.
+- `_briefing_week()` verified against real calendar dates: a Thursday resolves
+  to that week's Monday–Friday, a Saturday rolls forward to the coming week.
+- `python -m compileall` across all cogs — exit 0.
+- Secret scan — no `.env` value appears in any tracked file.
+
+**Note on `bot.py`** — this file needed **no changes**. `discover_extensions()`
+globs `cogs/*.py` at startup, so `earnings_tracker.py` was picked up
+automatically and its commands synced without registration. Adding a manual
+import list would have been a regression.
+
+**Final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | `/stock`, `/macro`, `/test_briefing`, `/test_macro_alert`, `/track_earnings`, `/untrack_earnings`, `/list_earnings` |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 48/48 |
+
+**Still not exercised:** posting behaviour for the new commands, a real earnings
+result embed from live Finnhub data, and the 17:30 check firing on schedule.
+Run `/test_briefing` and `/test_macro_alert` in Discord to confirm those.
