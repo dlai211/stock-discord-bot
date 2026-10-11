@@ -161,15 +161,61 @@ rather than showing a partial calculation.
   a DST-aware `ZoneInfo` timezone, so it stays at 08:00 ET across the March and
   November clock changes).
 - **Window:** Monday through Friday of the current week.
-- **Prioritisation:** a curated high-interest list (mega-cap tech plus other
-  widely held names) is surfaced first and marked with ⭐.
-- **Caps:** max 12 lines per day and 25 lines overall, keeping each embed field
-  safely under Discord's 1024-character limit.
+- **Selection:** high-interest names plus any company with an analyst estimate.
+  See below.
 - **Failure handling:** a failed Finnhub call logs and skips the week rather than
   cancelling the schedule. A failed *snapshot* call does not even cost the week —
   the briefing still posts, with the missing quotes rendered `N/A`.
 - **Market snapshot:** a `📊 Market Snapshot (Monday Open)` field covering 17
   assets across crypto, equities, bonds, commodities and currencies. See §5.8.
+
+#### Row format
+
+One company per line, with every optional part dropped when the API leaves it
+null:
+
+```
+⭐ JPM · Q3 · EPS est $5.92 · Pre-Market (~05:30-06:30 PT)
+```
+
+The year is left out of the quarter — the title already carries the date range.
+`EPS est` is dollar-signed: Finnhub does not state which currency an estimate is
+in, and the overwhelming majority of names on this calendar report in USD.
+
+#### What gets listed
+
+Two rules, in priority order:
+
+1. **High-interest names always appear**, whether or not anyone covers them. They
+   are never dropped to satisfy a cap.
+2. **Everything else needs an analyst estimate.** A ticker with no `epsEstimate`
+   is almost always an uncovered micro-cap. These were flooding the listing and
+   crowding out the days that actually mattered.
+
+#### Even spread across the week
+
+A per-day cap of **5 lines**, with the weekly budget divided by the number of
+days still to come:
+
+```
+lines_allowed = max(MIN_PER_DAY, min(MAX_PER_DAY, remaining // days_left))
+```
+
+A heavy Monday therefore cannot spend Friday's allowance, and `MIN_PER_DAY = 1`
+guarantees each remaining day still gets a line once the budget runs out.
+
+**This replaced a real bug.** The previous version gave each day up to 12 lines
+out of a shared 25-line pool and then `break`-ed out of the loop once the pool
+was empty — so a busy Monday and Tuesday ended the briefing at Wednesday, and
+Thursday and Friday were missing entirely. The `break` is gone; a day is now
+skipped only when it has no scheduled earnings at all.
+
+A day whose reports all lack estimates still gets a field reading
+`*No analyst estimates available*`, so an empty day is never mistaken for a bug.
+
+Overflow reads `*…and N more with estimates*`. The word "estimates" matters here:
+the headline company count includes the filtered-out micro-caps, so a bare "and
+2 more" would look wrong next to a count of 201.
 
 ### 5.4 Macro Release Alerts — `cogs/macro_alerts.py`
 
@@ -828,3 +874,84 @@ Run `/test_briefing` and `/test_macro_alert` in Discord to confirm those.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 78/78 |
+
+### 2026-10-11 16:50 PT — Briefing: filter uncovered names, spread the week evenly
+
+**Fixed — days were being cut off entirely.** The briefing gave each day up to
+**12** lines out of a shared 25-line pool, then `break`-ed out of the loop once
+the pool hit zero. Two busy days spent the whole budget, so the briefing ended at
+Wednesday and **Thursday and Friday never appeared at all**. Three changes:
+
+1. `MAX_PER_DAY` dropped from 12 to **5**, which is what "4-5 top names a day"
+   asks for and lands exactly on the 25-line budget across five days.
+2. The budget is now divided by the days still to come —
+   `max(MIN_PER_DAY, min(MAX_PER_DAY, remaining // days_left))` — so a heavy
+   Monday cannot spend Friday's allowance.
+3. **The `break` is gone.** With `MIN_PER_DAY = 1`, a day is now skipped only
+   when it genuinely has no scheduled earnings.
+
+**Fixed — the listing was dominated by uncovered micro-caps.** A company now
+earns a line only if it is on the high-interest list **or** has an analyst
+estimate. High-interest names are exempt from the filter and from the cap: they
+are never dropped, even on a day with more of them than the per-day allowance.
+
+**Changed — compact rows.** The format is now exactly as specified:
+
+```
+⭐ JPM · Q3 · EPS est $5.92 · Pre-Market (~05:30-06:30 PT)
+```
+
+Bold was dropped from the ticker, the year dropped from the quarter (the title
+already carries the date range), the separator after the symbol is now ` · `
+rather than ` — `, and `EPS est` gained a `$`.
+
+**Added — an empty day says so.** A day whose reports all lack estimates still
+gets a field reading `*No analyst estimates available*`, so a quiet day is never
+mistaken for the filter misfiring.
+
+**Modified**
+- `cogs/scheduled_briefings.py` — added `MIN_PER_DAY`, `DAY_FIELD_BUDGET`, the
+  `_is_high_interest` / `_has_estimate` / `_is_worth_listing` predicates and
+  `_render_day()`, which returns the day's lines plus how many eligible entries
+  were cut.
+- `verify.py` — grown from 78 to **92 checks**.
+
+**Verified**
+- `python verify.py` — **92/92 checks passed**, exit 0.
+- The row format is asserted as an **exact string** against the one in the brief.
+- A busy-week fixture (30 companies on each of five days) now asserts that all
+  five days get a field, that **Friday survives**, and that no day exceeds the
+  cap plus its overflow note. This is the regression test for the bug above.
+- A day with **8 high-interest names** — more than the cap of 5 — asserts that
+  all 8 still appear and the field stays inside Discord's 1024-character limit.
+- The filter is checked in both directions: a starred ticker with **no** estimate
+  is still listed, an unstarred ticker with **no** estimate is dropped, and an
+  unstarred ticker **with** an estimate is kept.
+- Rendered a realistic noisy week (201 companies, 11 of them notable, with
+  micro-caps on Monday through Wednesday) and read the output: every day present,
+  rows in the specified format, overflow counted correctly.
+- `python -m compileall` — exit 0.
+
+**Notes**
+- **No network calls were made in this phase.** The preview above used synthetic
+  data, so nothing was fetched from Yahoo or Finnhub.
+- The overflow line reads `*…and N more with estimates*` rather than `*…and N
+  more*`. The headline count includes the filtered micro-caps, so "and 2 more"
+  next to "201 companies report" reads as a contradiction. Saying which pool the
+  "more" comes from removes the ambiguity.
+- **`$` on EPS is an assumption.** Finnhub does not state the estimate's
+  currency. The filter and the high-interest list both skew heavily toward US
+  issuers, so USD is right in practice, but a foreign issuer reporting in EUR
+  would be labelled with a dollar sign.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 7 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Market snapshot symbols resolving | 17/17 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 92/92 |

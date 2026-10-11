@@ -203,6 +203,8 @@ async def main() -> int:
     )
     from cogs.market_commands import MarketCommands
     from cogs.scheduled_briefings import (
+        HIGH_INTEREST,
+        MAX_PER_DAY,
         SNAPSHOT_GROUPS,
         ScheduledBriefings,
         timing_label,
@@ -217,16 +219,26 @@ async def main() -> int:
     monday = date(2026, 10, 5)
     friday = monday + timedelta(days=4)
     sample = [
+        # High-interest with no estimate: must still be listed.
         {
             "date": monday.isoformat(),
             "symbol": "AAPL",
             "quarter": 4,
             "year": 2026,
-            "epsEstimate": 1.2345,
+            "epsEstimate": None,
             "hour": "amc",
         },
-        # Deliberately missing fields, to prove nulls are skipped rather than rendered.
+        # Unstarred with no estimate: filtered out as an uncovered micro-cap.
         {"date": monday.isoformat(), "symbol": "ZZZZ", "epsEstimate": None, "hour": None},
+        # Unstarred but covered: eligible, to prove the filter is not "starred only".
+        {
+            "date": monday.isoformat(),
+            "symbol": "ACZT",
+            "quarter": 1,
+            "year": 2026,
+            "epsEstimate": 0.12,
+            "hour": "bmo",
+        },
         # Overflow, to force the per-day cap and the "…and N more" line.
         *[
             {
@@ -243,7 +255,10 @@ async def main() -> int:
 
     try:
         briefing = ScheduledBriefings._build_embed(monday, friday, sample)
-        check("Briefing embed builds", True, f"{len(briefing.fields)} day field(s)")
+        day_fields = [
+            field for field in briefing.fields if "Market Snapshot" not in field.name
+        ]
+        check("Briefing embed builds", True, f"{len(day_fields)} day field(s)")
         widest = max((len(field.value) for field in briefing.fields), default=0)
         check(
             "Briefing fields fit Discord's 1024-char cap",
@@ -443,6 +458,139 @@ async def main() -> int:
         "Snapshot still renders when the week has no earnings",
         any("Market Snapshot" in field.name for field in no_earnings.fields),
         "; ".join(field.name for field in no_earnings.fields),
+    )
+
+    # ------------------------------------------------- briefing row selection
+    section("earnings briefing selection")
+
+    def format_entry(entry):
+        return ScheduledBriefings._format_entry(entry)
+
+    # The exact row the brief specified.
+    check(
+        "Row format matches the spec",
+        format_entry({"symbol": "JPM", "quarter": 3, "epsEstimate": 5.92, "hour": "bmo"})
+        == "⭐ JPM · Q3 · EPS est $5.92 · Pre-Market (~05:30-06:30 PT)",
+        format_entry({"symbol": "JPM", "quarter": 3, "epsEstimate": 5.92, "hour": "bmo"}),
+    )
+    check(
+        "An unstarred row carries no star",
+        format_entry({"symbol": "XYZ", "epsEstimate": 1.5}) == "XYZ · EPS est $1.50",
+        format_entry({"symbol": "XYZ", "epsEstimate": 1.5}),
+    )
+    check(
+        "A row with no details is just the symbol",
+        format_entry({"symbol": "XYZ"}) == "XYZ",
+        format_entry({"symbol": "XYZ"}),
+    )
+    check(
+        "The year is not repeated in the quarter",
+        "2026" not in format_entry(
+            {"symbol": "JPM", "quarter": 3, "year": 2026, "epsEstimate": 5.92}
+        ),
+    )
+
+    selection = ScheduledBriefings._build_embed(monday, friday, sample)
+    monday_value = next(
+        (field.value for field in selection.fields if field.name.startswith("Monday")),
+        "",
+    )
+    check(
+        "A high-interest name with no estimate is still listed",
+        "AAPL" in monday_value,
+        monday_value.replace("\n", " / "),
+    )
+    check(
+        "An uncovered unstarred ticker is filtered out",
+        "ZZZZ" not in monday_value,
+        "ZZZZ absent" if "ZZZZ" not in monday_value else "ZZZZ still present",
+    )
+    check(
+        "A covered unstarred ticker is still listed",
+        "ACZT" in monday_value,
+        monday_value.replace("\n", " / "),
+    )
+
+    # The reported bug: a heavy Monday and Tuesday consumed the whole 25-line
+    # budget, so Thursday and Friday were cut off entirely.
+    busy_week = []
+    for offset in range(5):
+        day = (monday + timedelta(days=offset)).isoformat()
+        busy_week.extend(
+            {
+                "date": day,
+                "symbol": f"D{offset}X{index:02d}",
+                "quarter": 3,
+                "year": 2026,
+                "epsEstimate": 1.0 + index,
+                "hour": "bmo",
+            }
+            for index in range(30)
+        )
+
+    busy = ScheduledBriefings._build_embed(monday, friday, busy_week)
+    busy_days = [
+        field for field in busy.fields if "Market Snapshot" not in field.name
+    ]
+    check("Every weekday gets a field", len(busy_days) == 5, f"{len(busy_days)} of 5")
+    check(
+        "Friday is not cut off by a heavy Monday",
+        any("Friday" in field.name for field in busy_days),
+        ", ".join(field.name for field in busy_days),
+    )
+    line_counts = [len(field.value.split("\n")) for field in busy_days]
+    check(
+        "No day exceeds the cap, plus room for its overflow note",
+        all(count <= MAX_PER_DAY + 1 for count in line_counts),
+        f"lines per day: {line_counts}",
+    )
+    check(
+        "Every busy day reports an overflow count",
+        all("more with estimates" in field.value for field in busy_days),
+        "overflow wording distinguishes filtered micro-caps",
+    )
+
+    # Requirement: high-interest names are never dropped to meet the per-day cap.
+    starred_heavy = [
+        {
+            "date": monday.isoformat(),
+            "symbol": symbol,
+            "quarter": 3,
+            "year": 2026,
+            "epsEstimate": None,
+            "hour": "bmo",
+        }
+        for symbol in list(HIGH_INTEREST)[:8]
+    ]
+    overflowing = ScheduledBriefings._build_embed(monday, friday, starred_heavy)
+    starred_day = next(
+        field for field in overflowing.fields if field.name.startswith("Monday")
+    )
+    check(
+        "More high-interest names than the cap all still show",
+        all(symbol in starred_day.value for symbol in list(HIGH_INTEREST)[:8]),
+        f"{len(starred_day.value.splitlines())} lines for 8 starred names (cap {MAX_PER_DAY})",
+    )
+    check(
+        "A starred-only day still fits Discord's field cap",
+        len(starred_day.value) <= 1024,
+        f"{len(starred_day.value)} chars",
+    )
+
+    # A day whose reports all lack estimates still gets a field, so it is clear
+    # the day was not dropped by a bug.
+    uncovered = ScheduledBriefings._build_embed(
+        monday,
+        friday,
+        [{"date": monday.isoformat(), "symbol": "MICRO", "epsEstimate": None}],
+    )
+    uncovered_day = next(
+        field for field in uncovered.fields if field.name.startswith("Monday")
+    )
+    check(
+        "A day with no covered names says so",
+        "No analyst estimates" in uncovered_day.value,
+        uncovered_day.value,
     )
 
     # ------------------------------------------------------------- test posts

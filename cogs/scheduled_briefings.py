@@ -35,8 +35,17 @@ HIGH_INTEREST_RANK = {ticker: index for index, ticker in enumerate(HIGH_INTEREST
 
 # Discord caps a field value at 1024 characters, so the listing is bounded
 # twice: per day and across the whole embed.
-MAX_PER_DAY = 12
+# A small per-day cap is the point. With a large one, a heavy Monday and Tuesday
+# consumed the whole budget and Thursday and Friday were cut off entirely. Five
+# lines a day across five days lands exactly on MAX_TOTAL.
+MAX_PER_DAY = 5
+MIN_PER_DAY = 1
 MAX_TOTAL = 25
+
+# Hard character ceiling for a single day's field, leaving headroom inside
+# Discord's 1024 limit. Only binds on a day with an unusual number of
+# high-interest names, which are never dropped to meet the line cap.
+DAY_FIELD_BUDGET = 1000
 
 # Reporting slots. The hours are US/Eastern — the clock the exchange runs on —
 # and the Pacific range shown in the label is derived from them, never typed in
@@ -131,6 +140,24 @@ def _format_snapshot_value(value: float | None, kind: str) -> str:
 
 def _format_snapshot_change(percent: float | None) -> str:
     return "N/A" if percent is None else f"{percent:+.2f}%"
+
+
+def _is_high_interest(entry: dict[str, Any]) -> bool:
+    return str(entry.get("symbol") or "").strip().upper() in HIGH_INTEREST_RANK
+
+
+def _has_estimate(entry: dict[str, Any]) -> bool:
+    return isinstance(entry.get("epsEstimate"), (int, float))
+
+
+def _is_worth_listing(entry: dict[str, Any]) -> bool:
+    """Whether a company earns a line in the briefing.
+
+    High-interest names always do. Everything else needs an analyst estimate:
+    a ticker with no EPS estimate is almost always a micro-cap with no coverage,
+    and those used to crowd out the days that matter.
+    """
+    return _is_high_interest(entry) or _has_estimate(entry)
 
 
 class BriefingNotSent(Exception):
@@ -426,40 +453,52 @@ class ScheduledBriefings(commands.Cog):
         if total == 0:
             embed.description = "No earnings scheduled this week."
         else:
-            watched = sum(
-                1
-                for entry in entries
-                if str(entry.get("symbol") or "").strip().upper() in HIGH_INTEREST_RANK
-            )
+            watched = sum(1 for entry in entries if _is_high_interest(entry))
             embed.description = (
                 f"**{total}** companies report Monday–Friday, **{watched}** on the "
-                "high-interest list. ⭐ marks the high-interest names."
+                "high-interest list.\n"
+                "*Listed: ⭐ high-interest names, plus any other company with an "
+                "analyst estimate. A ticker with no EPS estimate is almost always an "
+                "uncovered micro-cap.*"
             )
 
+            week = [monday + timedelta(days=offset) for offset in range(5)]
+            reporting_days = [day for day in week if day.isoformat() in by_day]
+
             remaining = MAX_TOTAL
-            for offset in range(5):
-                day = monday + timedelta(days=offset)
+            for index, day in enumerate(reporting_days):
+                days_left = len(reporting_days) - index
+                # Divide what is left by the days still to come, so a heavy
+                # Monday cannot spend Friday's allowance. MIN_PER_DAY then
+                # guarantees every remaining day gets at least one line even
+                # once the budget is exhausted.
+                lines_allowed = max(
+                    MIN_PER_DAY, min(MAX_PER_DAY, remaining // days_left)
+                )
+
                 day_entries = sorted(
                     by_day.get(day.isoformat(), []), key=cls._sort_key
                 )
-                if not day_entries:
-                    continue
+                lines, hidden = cls._render_day(
+                    [entry for entry in day_entries if _is_worth_listing(entry)],
+                    lines_allowed,
+                )
 
-                take = min(len(day_entries), MAX_PER_DAY, remaining)
-                lines = [cls._format_entry(entry) for entry in day_entries[:take]]
-                hidden = len(day_entries) - take
-                if hidden > 0:
-                    lines.append(f"*…and {hidden} more*")
+                if not lines:
+                    # The day has reports, but nothing with coverage worth
+                    # showing. Say so rather than dropping the day silently.
+                    lines = ["*No analyst estimates available*"]
+                elif hidden > 0:
+                    # "more with estimates", not "more": the headline count
+                    # includes uncovered micro-caps that were filtered out.
+                    lines.append(f"*…and {hidden} more with estimates*")
 
                 embed.add_field(
                     name=f"{day:%A} · {day:%b} {day.day}",
                     value="\n".join(lines),
                     inline=False,
                 )
-
-                remaining -= take
-                if remaining <= 0:
-                    break
+                remaining = max(0, remaining - len(lines))
 
         # The snapshot goes last: the earnings detail is the point of the post,
         # so the week's actual news should be the first thing read.
@@ -492,20 +531,61 @@ class ScheduledBriefings(commands.Cog):
 
     @staticmethod
     def _format_entry(entry: dict[str, Any]) -> str:
-        symbol = str(entry.get("symbol") or "").strip().upper()
-        star = "⭐ " if symbol in HIGH_INTEREST_RANK else ""
+        """One company on one line, e.g.
 
-        quarter = ""
-        if entry.get("quarter") is not None and entry.get("year") is not None:
-            quarter = f"Q{entry['quarter']} {entry['year']}"
+        '⭐ JPM · Q3 · EPS est $5.92 · Pre-Market (~05:30-06:30 PT)'
+
+        The year is left out of the quarter — the title already carries the date
+        range — and every optional part is dropped when the API leaves it null.
+        """
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        parts = ["⭐ " + symbol if _is_high_interest(entry) else symbol]
+
+        if entry.get("quarter") is not None:
+            parts.append(f"Q{entry['quarter']}")
 
         estimate = entry.get("epsEstimate")
-        eps = f"EPS est {estimate:,.2f}" if isinstance(estimate, (int, float)) else ""
+        if isinstance(estimate, (int, float)):
+            # Finnhub does not say which currency an estimate is in. The vast
+            # majority of names on this calendar report in USD.
+            parts.append(f"EPS est ${estimate:,.2f}")
 
         timing = timing_label(str(entry.get("hour") or ""))
+        if timing:
+            parts.append(timing)
 
-        details = " · ".join(part for part in (quarter, eps, timing) if part)
-        return f"{star}**{symbol}**" + (f" — {details}" if details else "")
+        return " · ".join(parts)
+
+    @classmethod
+    def _render_day(
+        cls, entries: list[dict[str, Any]], lines_allowed: int
+    ) -> tuple[list[str], int]:
+        """Format one day's lines, and report how many eligible entries were cut.
+
+        High-interest names are never dropped to meet the cap — only the
+        non-starred filler is trimmed.
+        """
+        starred = [entry for entry in entries if _is_high_interest(entry)]
+        others = [entry for entry in entries if not _is_high_interest(entry)]
+
+        chosen = list(starred)
+        room = max(0, lines_allowed - len(chosen))
+        chosen.extend(others[:room])
+        hidden = len(others) - min(room, len(others))
+
+        lines: list[str] = []
+        used = 0
+        for entry in chosen:
+            line = cls._format_entry(entry)
+            if used + len(line) + 1 > DAY_FIELD_BUDGET:
+                # Only reachable on a day with enough high-interest names to
+                # fill the field on their own.
+                hidden += 1
+                continue
+            lines.append(line)
+            used += len(line) + 1
+
+        return lines, hidden
 
 
 async def setup(bot: commands.Bot) -> None:
