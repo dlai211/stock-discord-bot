@@ -132,6 +132,7 @@ async def main() -> int:
     for expected in (
         "stock",
         "macro",
+        "earnings",
         "test_briefing",
         "test_macro_alert",
         "track_earnings",
@@ -204,11 +205,12 @@ async def main() -> int:
     from cogs.market_commands import MarketCommands
     from cogs.scheduled_briefings import (
         HIGH_INTEREST,
-        MAX_PER_DAY,
         SNAPSHOT_GROUPS,
+        TIER1_RELEASES,
         ScheduledBriefings,
-        timing_label,
+        tier1_match,
     )
+    from utils import timing_label
 
     check(
         "Three FRED series monitored",
@@ -253,11 +255,17 @@ async def main() -> int:
         ],
     ]
 
+    def day_fields_of(embed):
+        """Day-by-day earnings fields, excluding the macro and snapshot sections."""
+        return [
+            field
+            for field in embed.fields
+            if "Snapshot" not in field.name and "Macro" not in field.name
+        ]
+
     try:
         briefing = ScheduledBriefings._build_embed(monday, friday, sample)
-        day_fields = [
-            field for field in briefing.fields if "Market Snapshot" not in field.name
-        ]
+        day_fields = day_fields_of(briefing)
         check("Briefing embed builds", True, f"{len(day_fields)} day field(s)")
         widest = max((len(field.value) for field in briefing.fields), default=0)
         check(
@@ -267,7 +275,11 @@ async def main() -> int:
         )
         rendered = " ".join(field.value for field in briefing.fields)
         check("Briefing includes the priority name", "AAPL" in rendered)
-        check("Briefing reports overflow", "more" in rendered)
+        check(
+            "A day holding only untracked companies says so",
+            "No high-interest or tracked companies" in rendered,
+            "the filter emptied Friday, not a bug",
+        )
     except Exception as error:  # noqa: BLE001 - reporting the failure is the point
         check("Briefing embed builds", False, f"{type(error).__name__}: {error}")
 
@@ -490,48 +502,74 @@ async def main() -> int:
         ),
     )
 
+    # The listing is now: high-interest names, or tickers the user tracks.
+    # Everything else is left out however well covered it is.
     selection = ScheduledBriefings._build_embed(monday, friday, sample)
     monday_value = next(
         (field.value for field in selection.fields if field.name.startswith("Monday")),
         "",
     )
     check(
-        "A high-interest name with no estimate is still listed",
+        "A high-interest name is listed",
         "AAPL" in monday_value,
         monday_value.replace("\n", " / "),
     )
     check(
-        "An uncovered unstarred ticker is filtered out",
+        "An unstarred, untracked ticker is left out",
+        "ACZT" not in monday_value,
+        monday_value.replace("\n", " / "),
+    )
+    check(
+        "An uncovered ticker is left out",
         "ZZZZ" not in monday_value,
         "ZZZZ absent" if "ZZZZ" not in monday_value else "ZZZZ still present",
     )
+
+    tracked_view = ScheduledBriefings._build_embed(
+        monday, friday, sample, tracked={"ACZT"}
+    )
+    tracked_monday = next(
+        (
+            field.value
+            for field in tracked_view.fields
+            if field.name.startswith("Monday")
+        ),
+        "",
+    )
     check(
-        "A covered unstarred ticker is still listed",
-        "ACZT" in monday_value,
-        monday_value.replace("\n", " / "),
+        "A tracked ticker is listed even though it is unstarred",
+        "ACZT" in tracked_monday,
+        tracked_monday.replace("\n", " / "),
+    )
+    check(
+        "Tracking one ticker does not let other unstarred tickers in",
+        "ZZZZ" not in tracked_monday,
     )
 
-    # The reported bug: a heavy Monday and Tuesday consumed the whole 25-line
-    # budget, so Thursday and Friday were cut off entirely.
+    # The reported bug: a heavy Monday and Tuesday consumed the whole budget and
+    # Thursday and Friday were cut off entirely. With the listing filtered this
+    # narrowly there is no line cap left to starve a day, so every day has to
+    # show every one of its names.
     busy_week = []
     for offset in range(5):
         day = (monday + timedelta(days=offset)).isoformat()
         busy_week.extend(
             {
                 "date": day,
-                "symbol": f"D{offset}X{index:02d}",
+                "symbol": f"TRK{offset}{index:02d}",
                 "quarter": 3,
                 "year": 2026,
                 "epsEstimate": 1.0 + index,
                 "hour": "bmo",
             }
-            for index in range(30)
+            for index in range(8)
         )
+    busy_tracked = {entry["symbol"] for entry in busy_week}
 
-    busy = ScheduledBriefings._build_embed(monday, friday, busy_week)
-    busy_days = [
-        field for field in busy.fields if "Market Snapshot" not in field.name
-    ]
+    busy = ScheduledBriefings._build_embed(
+        monday, friday, busy_week, tracked=busy_tracked
+    )
+    busy_days = day_fields_of(busy)
     check("Every weekday gets a field", len(busy_days) == 5, f"{len(busy_days)} of 5")
     check(
         "Friday is not cut off by a heavy Monday",
@@ -540,45 +578,42 @@ async def main() -> int:
     )
     line_counts = [len(field.value.split("\n")) for field in busy_days]
     check(
-        "No day exceeds the cap, plus room for its overflow note",
-        all(count <= MAX_PER_DAY + 1 for count in line_counts),
+        "Every tracked company is listed, with no cap",
+        all(count == 8 for count in line_counts),
         f"lines per day: {line_counts}",
     )
-    check(
-        "Every busy day reports an overflow count",
-        all("more with estimates" in field.value for field in busy_days),
-        "overflow wording distinguishes filtered micro-caps",
-    )
 
-    # Requirement: high-interest names are never dropped to meet the per-day cap.
-    starred_heavy = [
+    # A day with more names than a single field can hold still degrades cleanly.
+    flood = [
         {
             "date": monday.isoformat(),
-            "symbol": symbol,
+            "symbol": f"FLOOD{index:03d}",
             "quarter": 3,
             "year": 2026,
             "epsEstimate": None,
             "hour": "bmo",
         }
-        for symbol in list(HIGH_INTEREST)[:8]
+        for index in range(120)
     ]
-    overflowing = ScheduledBriefings._build_embed(monday, friday, starred_heavy)
-    starred_day = next(
-        field for field in overflowing.fields if field.name.startswith("Monday")
+    flooded = ScheduledBriefings._build_embed(
+        monday, friday, flood, tracked={entry["symbol"] for entry in flood}
+    )
+    flooded_day = next(
+        field for field in flooded.fields if field.name.startswith("Monday")
     )
     check(
-        "More high-interest names than the cap all still show",
-        all(symbol in starred_day.value for symbol in list(HIGH_INTEREST)[:8]),
-        f"{len(starred_day.value.splitlines())} lines for 8 starred names (cap {MAX_PER_DAY})",
+        "An over-long day stays inside Discord's field cap",
+        len(flooded_day.value) <= 1024,
+        f"{len(flooded_day.value)} chars",
     )
     check(
-        "A starred-only day still fits Discord's field cap",
-        len(starred_day.value) <= 1024,
-        f"{len(starred_day.value)} chars",
+        "An over-long day reports what it dropped",
+        "more" in flooded_day.value,
+        flooded_day.value.splitlines()[-1],
     )
 
-    # A day whose reports all lack estimates still gets a field, so it is clear
-    # the day was not dropped by a bug.
+    # A day whose reports are all ineligible still gets a field, so a quiet day
+    # can never be mistaken for one the code dropped.
     uncovered = ScheduledBriefings._build_embed(
         monday,
         friday,
@@ -588,9 +623,225 @@ async def main() -> int:
         field for field in uncovered.fields if field.name.startswith("Monday")
     )
     check(
-        "A day with no covered names says so",
-        "No analyst estimates" in uncovered_day.value,
+        "A day with nothing notable says so",
+        "No high-interest or tracked companies" in uncovered_day.value,
         uncovered_day.value,
+    )
+
+    # ---------------------------------------------------------- macro calendar
+    section("macro economic calendar")
+
+    check(
+        "The high-interest list is the curated 37",
+        len(HIGH_INTEREST) == 37,
+        f"{len(HIGH_INTEREST)} names",
+    )
+    check(
+        "Tier-1 list covers the four FRED-sourced releases",
+        [label for _, label, _, _ in TIER1_RELEASES]
+        == [
+            "CPI Inflation",
+            "Core PCE Price Index",
+            "Real GDP",
+            "Non-Farm Payrolls",
+        ],
+        ", ".join(label for _, label, _, _ in TIER1_RELEASES),
+    )
+    check(
+        "FOMC is excluded, because FRED cannot date a rate decision",
+        tier1_match("FOMC Press Release") is None,
+        "release 101 carries 365 dates a year",
+    )
+
+    check(
+        "A tier-1 release name matches",
+        tier1_match("Consumer Price Index") is not None,
+        str(tier1_match("Consumer Price Index")),
+    )
+    matched = tier1_match("Personal Income and Outlays")
+    check(
+        "Core PCE maps to the Personal Income and Outlays release",
+        matched is not None and matched[0] == "Core PCE Price Index",
+        str(matched),
+    )
+    check(
+        "Matching is exact, not by substring",
+        tier1_match("Sticky Price CPI") is None
+        and tier1_match("Gross Domestic Product by State") is None
+        and tier1_match("Trimmed Mean PCE Inflation Rate") is None
+        and tier1_match("Employment Situation Summary") is None,
+        "near-miss releases are rejected",
+    )
+    check(
+        "Non-tier-1 releases are ignored",
+        tier1_match("Producer Price Index") is None,
+        "PPI is not on the list",
+    )
+
+    macro_line = ScheduledBriefings._macro_field(
+        [{"date": date(2026, 10, 13), "label": "CPI Inflation", "clock": "05:30"}]
+    )
+    check(
+        "Macro line matches the spec",
+        macro_line == "Tuesday, Oct 13 · CPI Inflation · 05:30 PT",
+        macro_line,
+    )
+    check(
+        "An empty week says so explicitly",
+        "No major tier-1 macro releases" in ScheduledBriefings._macro_field([]),
+        ScheduledBriefings._macro_field([]),
+    )
+    check(
+        "A failed fetch is not reported as an empty week",
+        "Unavailable" in ScheduledBriefings._macro_field(None)
+        and "No major" not in ScheduledBriefings._macro_field(None),
+        ScheduledBriefings._macro_field(None),
+    )
+
+    macro_embed = ScheduledBriefings._build_embed(
+        monday,
+        friday,
+        sample,
+        macro_events=[
+            {"date": date(2026, 10, 13), "label": "CPI Inflation", "clock": "05:30"}
+        ],
+    )
+    macro_field = next(
+        (field for field in macro_embed.fields if "Macro" in field.name), None
+    )
+    check(
+        "Briefing carries the macro field",
+        macro_field is not None,
+        ", ".join(field.name for field in macro_embed.fields),
+    )
+    check(
+        "Macro field fits Discord's cap",
+        macro_field is not None and len(macro_field.value) <= 1024,
+        f"{len(macro_field.value)} chars" if macro_field else "missing",
+    )
+    # /test_briefing runs the same _build_embed, so a test post must carry the
+    # macro section too — not just the scheduled Monday run.
+    test_macro_embed = ScheduledBriefings._build_embed(
+        monday,
+        friday,
+        sample,
+        macro_events=[
+            {"date": date(2026, 10, 13), "label": "CPI Inflation", "clock": "05:30"}
+        ],
+        is_test=True,
+    )
+    check(
+        "A test post renders the macro field too",
+        any("Macro" in field.name for field in test_macro_embed.fields)
+        and "[TEST]" in (test_macro_embed.title or ""),
+        ", ".join(field.name for field in test_macro_embed.fields),
+    )
+
+    # ------------------------------------------------------------- /earnings
+    section("earnings lookup")
+
+    next_text = MarketCommands._next_report_text(
+        {
+            "date": "2026-11-02",
+            "hour": "amc",
+            "epsEstimate": 2.0214,
+            "revenueEstimate": 115327453620,
+        }
+    )
+    check(
+        "Next report shows the date",
+        "Monday, November 2, 2026" in next_text,
+        next_text.replace("\n", " / "),
+    )
+    check(
+        "Next report shows the session in Pacific",
+        "Post-Market (~13:00-14:00 PT)" in next_text,
+    )
+    check(
+        "Next report shows the consensus figures",
+        "$2.02" in next_text and "$115.33B" in next_text,
+    )
+    check(
+        "An unscheduled report says so",
+        "No upcoming report" in MarketCommands._next_report_text(None),
+    )
+    unconfirmed = MarketCommands._next_report_text({"date": "2026-11-02", "hour": ""})
+    check("An unconfirmed session says so", "not yet confirmed" in unconfirmed, unconfirmed)
+
+    last_text = MarketCommands._last_report_text(
+        [
+            {
+                "quarter": 3,
+                "year": 2026,
+                "period": "2026-06-30",
+                "actual": 1.91,
+                "estimate": 1.9271,
+                "surprisePercent": -0.8873,
+            },
+            {
+                "quarter": 2,
+                "year": 2026,
+                "period": "2026-03-31",
+                "actual": 2.01,
+                "estimate": 1.9884,
+                "surprisePercent": 1.0863,
+            },
+        ]
+    )
+    check(
+        "Last quarter shows actual against estimate",
+        "$1.91" in last_text and "$1.93" in last_text,
+        last_text.replace("\n", " / "),
+    )
+    check("Last quarter shows the surprise", "-0.89%" in last_text)
+    check(
+        "Prior quarters are summarised on one line",
+        "Prior" in last_text and "$2.01" in last_text,
+    )
+    check(
+        "No reported quarters says so",
+        "No reported quarters" in MarketCommands._last_report_text([]),
+    )
+    check(
+        "A quarter with a missing estimate still renders",
+        "N/A"
+        in MarketCommands._last_report_text([{"quarter": 1, "year": 2026, "actual": 1.0}]),
+    )
+    check(
+        "Earnings text stays inside Discord's field cap",
+        len(next_text) <= 1024 and len(last_text) <= 1024,
+        f"next={len(next_text)}, last={len(last_text)}",
+    )
+
+    lookup_cog = MarketCommands(bot=None)
+    lookup_embed = lookup_cog._earnings_embed(
+        "AAPL",
+        {
+            "date": "2026-11-02",
+            "hour": "amc",
+            "epsEstimate": 2.0214,
+            "revenueEstimate": 115327453620,
+        },
+        [
+            {
+                "quarter": 3,
+                "year": 2026,
+                "period": "2026-06-30",
+                "actual": 1.91,
+                "estimate": 1.9271,
+                "surprisePercent": -0.8873,
+            }
+        ],
+    )
+    check(
+        "Earnings embed builds",
+        [field.name for field in lookup_embed.fields] == ["Next report", "Last reported"],
+        ", ".join(field.name for field in lookup_embed.fields),
+    )
+    check(
+        "A miss is coloured red",
+        lookup_embed.color.value == 0xE74C3C,
+        hex(lookup_embed.color.value),
     )
 
     # ------------------------------------------------------------- test posts

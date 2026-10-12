@@ -12,12 +12,21 @@ from typing import Any
 
 import discord
 import finnhub
+import requests
 import yfinance as yf
 from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from utils import resolve_channel, retry_async, run_blocking, to_pacific_clock
+from cogs.earnings_tracker import load_watchlist
+from utils import (
+    parse_iso_date,
+    resolve_channel,
+    retry_async,
+    run_blocking,
+    timing_label,
+    to_pacific_clock,
+)
 
 log = logging.getLogger(__name__)
 
@@ -35,26 +44,37 @@ HIGH_INTEREST_RANK = {ticker: index for index, ticker in enumerate(HIGH_INTEREST
 
 # Discord caps a field value at 1024 characters, so the listing is bounded
 # twice: per day and across the whole embed.
-# A small per-day cap is the point. With a large one, a heavy Monday and Tuesday
-# consumed the whole budget and Thursday and Friday were cut off entirely. Five
-# lines a day across five days lands exactly on MAX_TOTAL.
-MAX_PER_DAY = 5
-MIN_PER_DAY = 1
-MAX_TOTAL = 25
-
-# Hard character ceiling for a single day's field, leaving headroom inside
-# Discord's 1024 limit. Only binds on a day with an unusual number of
-# high-interest names, which are never dropped to meet the line cap.
+# The listing is filtered rather than capped, so no per-day line limit is needed
+# any more. This is a hard character ceiling for one day's field, leaving
+# headroom inside Discord's 1024 limit; it only binds on a freak day.
 DAY_FIELD_BUDGET = 1000
 
-# Reporting slots. The hours are US/Eastern — the clock the exchange runs on —
-# and the Pacific range shown in the label is derived from them, never typed in
-# by hand, so the two can never drift apart.
-TIMING_WINDOWS = {
-    "bmo": ("Pre-Market", 8, 30, 9, 30),
-    "amc": ("Post-Market", 16, 0, 17, 0),
-    "dmh": ("Market Hours", 9, 30, 16, 0),
-}
+# Tier-1 US releases, matched against FRED's *exact* release name. Substring
+# matching would also catch "Sticky Price CPI", "Gross Domestic Product by
+# State" and "Trimmed Mean PCE Inflation Rate", none of which is the headline
+# print. Fields are (FRED release name, display label, hour ET, minute ET).
+#
+# FRED publishes release dates but no times, so each entry carries the fixed
+# time the issuing agency uses — BLS and BEA both publish at 08:30 ET. The
+# Pacific rendering is derived from that.
+#
+# FOMC rate decisions are deliberately absent. FRED's only FOMC release is
+# "FOMC Press Release", which carries a date for *every* day of the year (365 in
+# 2026) because it also covers routine speeches and statements, so it cannot
+# pick out a rate decision. The fed funds target series (DFEDTARU and friends)
+# resolve to that same release, and a future meeting day cannot be derived from
+# anything FRED publishes. Adding FOMC back needs a dated meeting calendar, not
+# a data feed.
+TIER1_RELEASES = (
+    ("consumer price index", "CPI Inflation", 8, 30),
+    ("personal income and outlays", "Core PCE Price Index", 8, 30),
+    ("gross domestic product", "Real GDP", 8, 30),
+    ("employment situation", "Non-Farm Payrolls", 8, 30),
+)
+
+# FRED's release-dates endpoint, used rather than Finnhub's /calendar/economic,
+# which returns HTTP 403 on a free-tier key.
+FRED_RELEASES_URL = "https://api.stlouisfed.org/fred/releases/dates"
 
 # The Monday market snapshot. Each entry is (yfinance symbol, display label,
 # value kind); the kind decides how the number is rendered.
@@ -113,17 +133,6 @@ SNAPSHOT_GROUPS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
 SNAPSHOT_FIELD_BUDGET = 980
 
 
-def timing_label(code: str) -> str:
-    """Human-readable reporting slot, e.g. 'Pre-Market (~05:30-06:30 PT)'."""
-    window = TIMING_WINDOWS.get((code or "").lower())
-    if window is None:
-        return ""
-    name, start_hour, start_minute, end_hour, end_minute = window
-    start = to_pacific_clock(start_hour, start_minute)
-    end = to_pacific_clock(end_hour, end_minute)
-    return f"{name} (~{start}-{end} PT)"
-
-
 def _format_snapshot_value(value: float | None, kind: str) -> str:
     if value is None:
         return "N/A"
@@ -142,22 +151,64 @@ def _format_snapshot_change(percent: float | None) -> str:
     return "N/A" if percent is None else f"{percent:+.2f}%"
 
 
+def _symbol_of(entry: dict[str, Any]) -> str:
+    return str(entry.get("symbol") or "").strip().upper()
+
+
 def _is_high_interest(entry: dict[str, Any]) -> bool:
-    return str(entry.get("symbol") or "").strip().upper() in HIGH_INTEREST_RANK
+    return _symbol_of(entry) in HIGH_INTEREST_RANK
 
 
-def _has_estimate(entry: dict[str, Any]) -> bool:
-    return isinstance(entry.get("epsEstimate"), (int, float))
-
-
-def _is_worth_listing(entry: dict[str, Any]) -> bool:
+def _is_listed(entry: dict[str, Any], tracked: set[str]) -> bool:
     """Whether a company earns a line in the briefing.
 
-    High-interest names always do. Everything else needs an analyst estimate:
-    a ticker with no EPS estimate is almost always a micro-cap with no coverage,
-    and those used to crowd out the days that matter.
+    Only high-interest names and tickers the user explicitly tracks. Everything
+    else is left out — the calendar is mostly uncovered micro-caps, and listing
+    them buried the handful of names that actually matter.
     """
-    return _is_high_interest(entry) or _has_estimate(entry)
+    symbol = _symbol_of(entry)
+    return symbol in HIGH_INTEREST_RANK or symbol in tracked
+
+
+def _tracked_symbols() -> set[str]:
+    """Symbols followed with /track_earnings, re-read so new ones are picked up."""
+    try:
+        return set(load_watchlist())
+    except Exception:  # noqa: BLE001 - a broken watch list must not stop the briefing
+        log.warning("Could not read the tracked earnings list", exc_info=True)
+        return set()
+
+
+def tier1_match(release_name: str) -> tuple[str, int, int] | None:
+    """Map an exact FRED release name to (label, hour ET, minute ET)."""
+    lowered = (release_name or "").strip().lower()
+    for name, label, hour, minute in TIER1_RELEASES:
+        if lowered == name:
+            return label, hour, minute
+    return None
+
+
+def _fetch_release_dates_sync(monday: date, friday: date) -> list[dict[str, Any]]:
+    """FRED release dates inside the window. Blocking — call via run_blocking."""
+    response = requests.get(
+        FRED_RELEASES_URL,
+        params={
+            "api_key": config.FRED_API_KEY,
+            "file_type": "json",
+            "realtime_start": monday.isoformat(),
+            "realtime_end": friday.isoformat(),
+            # A future release has no observations yet, so FRED omits it unless
+            # this is set.
+            "include_release_dates_with_no_data": "true",
+            "limit": 1000,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        return []
+    return payload.get("release_dates") or []
 
 
 class BriefingNotSent(Exception):
@@ -299,9 +350,30 @@ class ScheduledBriefings(commands.Cog):
             snapshot = {}
 
         try:
+            macro_events = await retry_async(
+                self._fetch_macro_calendar,
+                monday,
+                friday,
+                attempts=2,
+                base_delay=3.0,
+                label="FRED release calendar",
+            )
+        except Exception:
+            # None rather than []: the section must be able to say "unavailable"
+            # instead of claiming nothing is scheduled this week.
+            log.exception("Macro calendar unavailable; posting the briefing without it")
+            macro_events = None
+
+        try:
             await channel.send(
                 embed=self._build_embed(
-                    monday, friday, calendar, snapshot, is_test=is_test
+                    monday,
+                    friday,
+                    calendar,
+                    snapshot,
+                    macro_events,
+                    _tracked_symbols(),
+                    is_test=is_test,
                 )
             )
         except discord.HTTPException as error:
@@ -418,6 +490,53 @@ class ScheduledBriefings(commands.Cog):
             blocks.append("```\n" + "\n".join(current) + "\n```")
         return blocks
 
+    # ---------------------------------------------------------- macro calendar
+
+    @classmethod
+    async def _fetch_macro_calendar(
+        cls, monday: date, friday: date
+    ) -> list[dict[str, Any]]:
+        """Tier-1 US releases scheduled between `monday` and `friday`."""
+        raw = await run_blocking(_fetch_release_dates_sync, monday, friday)
+
+        events: list[dict[str, Any]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            match = tier1_match(str(entry.get("release_name") or ""))
+            if match is None:
+                continue
+            label, hour, minute = match
+            day = parse_iso_date(entry.get("date"))
+            if day is None or not monday <= day <= friday:
+                continue
+            events.append(
+                {
+                    "date": day,
+                    "label": label,
+                    # Anchored to the release's own date, so the standard or
+                    # daylight offset applied is the right one.
+                    "clock": to_pacific_clock(hour, minute, day),
+                }
+            )
+
+        events.sort(key=lambda event: (event["date"], event["clock"]))
+        return events
+
+    @staticmethod
+    def _macro_field(events: list[dict[str, Any]] | None) -> str:
+        """The macro section body. `None` means the fetch failed, not that the
+        week is empty — those two must not look the same."""
+        if events is None:
+            return "*Unavailable — couldn't reach FRED's release calendar.*"
+        if not events:
+            return "*No major tier-1 macro releases scheduled this week.*"
+        return "\n".join(
+            f"{event['date']:%A, %b} {event['date'].day} · {event['label']} "
+            f"· {event['clock']} PT"
+            for event in events
+        )
+
     # ---------------------------------------------------------------- rendering
 
     @classmethod
@@ -427,10 +546,13 @@ class ScheduledBriefings(commands.Cog):
         friday: date,
         entries: list[dict[str, Any]],
         snapshot: dict[str, tuple[float | None, float | None]] | None = None,
+        macro_events: list[dict[str, Any]] | None = None,
+        tracked: set[str] | None = None,
         *,
         is_test: bool = False,
     ) -> discord.Embed:
         test_note = " · TEST POST" if is_test else ""
+        tracked = tracked or set()
         by_day: dict[str, list[dict[str, Any]]] = {}
         for entry in entries:
             day = entry.get("date")
@@ -453,52 +575,43 @@ class ScheduledBriefings(commands.Cog):
         if total == 0:
             embed.description = "No earnings scheduled this week."
         else:
-            watched = sum(1 for entry in entries if _is_high_interest(entry))
             embed.description = (
-                f"**{total}** companies report Monday–Friday, **{watched}** on the "
-                "high-interest list.\n"
-                "*Listed: ⭐ high-interest names, plus any other company with an "
-                "analyst estimate. A ticker with no EPS estimate is almost always an "
-                "uncovered micro-cap.*"
+                f"**{total}** companies report Monday–Friday.\n"
+                "*Listed: ⭐ high-interest names, plus anything you track with "
+                "`/track_earnings`. Everything else is left out to keep this "
+                "readable.*"
             )
 
             week = [monday + timedelta(days=offset) for offset in range(5)]
             reporting_days = [day for day in week if day.isoformat() in by_day]
 
-            remaining = MAX_TOTAL
-            for index, day in enumerate(reporting_days):
-                days_left = len(reporting_days) - index
-                # Divide what is left by the days still to come, so a heavy
-                # Monday cannot spend Friday's allowance. MIN_PER_DAY then
-                # guarantees every remaining day gets at least one line even
-                # once the budget is exhausted.
-                lines_allowed = max(
-                    MIN_PER_DAY, min(MAX_PER_DAY, remaining // days_left)
-                )
-
+            for day in reporting_days:
                 day_entries = sorted(
                     by_day.get(day.isoformat(), []), key=cls._sort_key
                 )
-                lines, hidden = cls._render_day(
-                    [entry for entry in day_entries if _is_worth_listing(entry)],
-                    lines_allowed,
+                lines, dropped = cls._render_day(
+                    [entry for entry in day_entries if _is_listed(entry, tracked)]
                 )
 
                 if not lines:
-                    # The day has reports, but nothing with coverage worth
-                    # showing. Say so rather than dropping the day silently.
-                    lines = ["*No analyst estimates available*"]
-                elif hidden > 0:
-                    # "more with estimates", not "more": the headline count
-                    # includes uncovered micro-caps that were filtered out.
-                    lines.append(f"*…and {hidden} more with estimates*")
+                    # The day has reports, but none worth listing. Say so rather
+                    # than dropping the day silently — a vanished day is
+                    # indistinguishable from a bug.
+                    lines = ["*No high-interest or tracked companies.*"]
+                elif dropped:
+                    lines.append(f"*…and {dropped} more*")
 
                 embed.add_field(
                     name=f"{day:%A} · {day:%b} {day.day}",
                     value="\n".join(lines),
                     inline=False,
                 )
-                remaining = max(0, remaining - len(lines))
+
+        embed.add_field(
+            name="\U0001f4c5 Macro Economic Calendar This Week",
+            value=cls._macro_field(macro_events),
+            inline=False,
+        )
 
         # The snapshot goes last: the earnings detail is the point of the post,
         # so the week's actual news should be the first thing read.
@@ -538,7 +651,7 @@ class ScheduledBriefings(commands.Cog):
         The year is left out of the quarter — the title already carries the date
         range — and every optional part is dropped when the API leaves it null.
         """
-        symbol = str(entry.get("symbol") or "").strip().upper()
+        symbol = _symbol_of(entry)
         parts = ["⭐ " + symbol if _is_high_interest(entry) else symbol]
 
         if entry.get("quarter") is not None:
@@ -557,35 +670,19 @@ class ScheduledBriefings(commands.Cog):
         return " · ".join(parts)
 
     @classmethod
-    def _render_day(
-        cls, entries: list[dict[str, Any]], lines_allowed: int
-    ) -> tuple[list[str], int]:
-        """Format one day's lines, and report how many eligible entries were cut.
-
-        High-interest names are never dropped to meet the cap — only the
-        non-starred filler is trimmed.
-        """
-        starred = [entry for entry in entries if _is_high_interest(entry)]
-        others = [entry for entry in entries if not _is_high_interest(entry)]
-
-        chosen = list(starred)
-        room = max(0, lines_allowed - len(chosen))
-        chosen.extend(others[:room])
-        hidden = len(others) - min(room, len(others))
-
+    def _render_day(cls, entries: list[dict[str, Any]]) -> tuple[list[str], int]:
+        """Format one day's lines, and report how many could not fit the field."""
         lines: list[str] = []
         used = 0
-        for entry in chosen:
+        for index, entry in enumerate(entries):
             line = cls._format_entry(entry)
             if used + len(line) + 1 > DAY_FIELD_BUDGET:
-                # Only reachable on a day with enough high-interest names to
-                # fill the field on their own.
-                hidden += 1
-                continue
+                # Only reachable on a freak day — the listing is filtered down to
+                # a handful of names before it gets here.
+                return lines, len(entries) - index
             lines.append(line)
             used += len(line) + 1
-
-        return lines, hidden
+        return lines, 0
 
 
 async def setup(bot: commands.Bot) -> None:

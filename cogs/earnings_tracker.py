@@ -46,8 +46,12 @@ TIMING_LABELS = {
 }
 
 
-def _load_watchlist() -> dict[str, dict[str, Any]]:
-    """The watch list as {symbol: {"added": "YYYY-MM-DD"}}."""
+def load_watchlist() -> dict[str, dict[str, Any]]:
+    """The watch list as {symbol: {"added": "YYYY-MM-DD"}}.
+
+    Public because scheduled_briefings reads the same file to decide which
+    non-high-interest tickers to include in the Monday post.
+    """
     data = load_json(WATCHLIST_PATH, {})
     if not isinstance(data, dict):
         log.warning("%s did not contain an object; starting empty", WATCHLIST_PATH)
@@ -73,7 +77,7 @@ class EarningsTracker(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._watchlist = _load_watchlist()
+        self._watchlist = load_watchlist()
         self._notified = _load_notified()
 
     async def cog_load(self) -> None:

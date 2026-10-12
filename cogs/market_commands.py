@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import discord
+import finnhub
 import yfinance as yf
 from discord import app_commands
 from discord.ext import commands
@@ -18,8 +19,10 @@ from utils import (
     format_money,
     format_number,
     format_signed,
+    parse_iso_date,
     retry_async,
     run_blocking,
+    timing_label,
 )
 
 log = logging.getLogger(__name__)
@@ -38,6 +41,14 @@ FRED_SERIES = {
 # Two years is plenty of history for a "latest reading" view and keeps the
 # FRED payload small.
 FRED_LOOKBACK_DAYS = 730
+
+# How far ahead to look for a company's next scheduled report. Companies report
+# quarterly, so this comfortably covers the next one.
+EARNINGS_LOOKAHEAD_DAYS = 200
+
+# Reported quarters to pull: the newest is shown in detail, the rest as a
+# one-line history.
+REPORTED_QUARTERS = 4
 
 # CPI is the headline inflation series. The year-over-year rate compares the
 # newest monthly observation against the one 12 months earlier, so the window
@@ -68,8 +79,11 @@ class MarketCommands(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # Constructing Fred() doesn't make a network call, so this is safe at load time.
+        # Neither constructor makes a network call, so this is safe at load time.
         self._fred = Fred(api_key=config.FRED_API_KEY) if config.FRED_API_KEY else None
+        self._finnhub = (
+            finnhub.Client(api_key=config.FINNHUB_KEY) if config.FINNHUB_KEY else None
+        )
 
     # ------------------------------------------------------------- /stock
 
@@ -353,6 +367,187 @@ class MarketCommands(commands.Cog):
             )
         )
         return embed
+
+    # ----------------------------------------------------------- /earnings
+
+    @app_commands.command(
+        name="earnings",
+        description="Next scheduled earnings date, and the last reported quarter.",
+    )
+    @app_commands.describe(ticker="Ticker symbol, e.g. AAPL")
+    async def earnings(self, interaction: discord.Interaction, ticker: str) -> None:
+        symbol = ticker.strip().upper()
+        if not symbol or len(symbol) > 12 or any(
+            character.isspace() for character in symbol
+        ):
+            await interaction.response.send_message(
+                f"`{ticker.strip()}` doesn't look like a ticker symbol.", ephemeral=True
+            )
+            return
+
+        if self._finnhub is None:
+            await interaction.response.send_message(
+                "`FINNHUB_KEY` isn't set, so earnings data is unavailable. "
+                "Add it to `.env` and restart the bot.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            upcoming = await retry_async(
+                self._fetch_next_earnings,
+                symbol,
+                attempts=2,
+                base_delay=2.0,
+                label=f"Finnhub calendar:{symbol}",
+            )
+            reported = await retry_async(
+                self._fetch_reported_quarters,
+                symbol,
+                attempts=2,
+                base_delay=2.0,
+                label=f"Finnhub earnings:{symbol}",
+            )
+        except Exception:
+            log.exception("Earnings lookup failed for %s", symbol)
+            await interaction.followup.send(
+                embed=self._error_embed(
+                    "Earnings data unavailable",
+                    f"Couldn't reach Finnhub for `{symbol}`. Try again in a moment.",
+                )
+            )
+            return
+
+        if upcoming is None and not reported:
+            await interaction.followup.send(
+                embed=self._error_embed(
+                    f"No earnings data: {symbol}",
+                    f"Finnhub has no earnings records for `{symbol}`. Check the "
+                    "spelling — it has to match the symbol Finnhub uses.",
+                )
+            )
+            return
+
+        await interaction.followup.send(
+            embed=self._earnings_embed(symbol, upcoming, reported)
+        )
+
+    async def _fetch_next_earnings(self, symbol: str) -> dict[str, Any] | None:
+        """The soonest scheduled report, or None if Finnhub lists none."""
+        today = datetime.now(config.EASTERN).date()
+        payload = await run_blocking(
+            self._finnhub.earnings_calendar,
+            _from=today.isoformat(),
+            to=(today + timedelta(days=EARNINGS_LOOKAHEAD_DAYS)).isoformat(),
+            symbol=symbol,
+            international=False,
+        )
+        entries = (payload or {}).get("earningsCalendar") or []
+        dated = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and parse_iso_date(entry.get("date"))
+        ]
+        if not dated:
+            return None
+        # Finnhub returns these furthest-out first, so take the minimum rather
+        # than trusting the ordering.
+        return min(dated, key=lambda entry: str(entry["date"]))
+
+    async def _fetch_reported_quarters(self, symbol: str) -> list[dict[str, Any]]:
+        """Past quarters, newest first (which is the order Finnhub returns)."""
+        rows = await run_blocking(
+            self._finnhub.company_earnings, symbol, REPORTED_QUARTERS
+        )
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _earnings_embed(
+        self,
+        symbol: str,
+        upcoming: dict[str, Any] | None,
+        reported: list[dict[str, Any]],
+    ) -> discord.Embed:
+        surprise = reported[0].get("surprisePercent") if reported else None
+        color = COLOR_NEUTRAL
+        if isinstance(surprise, (int, float)):
+            color = COLOR_UP if surprise >= 0 else COLOR_DOWN
+
+        embed = discord.Embed(
+            title=f"Earnings: {symbol}",
+            color=color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="Next report", value=self._next_report_text(upcoming), inline=False
+        )
+        embed.add_field(
+            name="Last reported", value=self._last_report_text(reported), inline=False
+        )
+        embed.set_footer(text="Source: Finnhub · times are US/Pacific")
+        return embed
+
+    @staticmethod
+    def _next_report_text(upcoming: dict[str, Any] | None) -> str:
+        if upcoming is None:
+            return "*No upcoming report on Finnhub's calendar.*"
+
+        day = parse_iso_date(upcoming.get("date"))
+        lines = [
+            f"**{day:%A, %B} {day.day}, {day.year}**"
+            if day
+            else "**Date not published**"
+        ]
+
+        timing = timing_label(str(upcoming.get("hour") or ""))
+        lines.append(timing or "*Session not yet confirmed*")
+
+        figures = []
+        estimate = upcoming.get("epsEstimate")
+        revenue = upcoming.get("revenueEstimate")
+        if isinstance(estimate, (int, float)):
+            figures.append(f"EPS est {format_money(estimate)}")
+        if isinstance(revenue, (int, float)):
+            figures.append(f"revenue est ${format_compact(revenue)}")
+        lines.append(" · ".join(figures) if figures else "*No consensus published yet*")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _last_report_text(reported: list[dict[str, Any]]) -> str:
+        if not reported:
+            return "*No reported quarters on record.*"
+
+        latest = reported[0]
+        quarter, year = latest.get("quarter"), latest.get("year")
+        period = parse_iso_date(latest.get("period"))
+
+        heading = f"**Q{quarter} {year}**" if quarter and year else "**Last quarter**"
+        if period:
+            heading += f" · quarter ended {period:%b} {period.day}, {period.year}"
+
+        comparison = (
+            f"Actual {format_money(latest.get('actual'))} "
+            f"vs est {format_money(latest.get('estimate'))}"
+        )
+        surprise = latest.get("surprisePercent")
+        if isinstance(surprise, (int, float)):
+            comparison += f" · **{format_signed(surprise, 2, '%')}** surprise"
+
+        lines = [heading, comparison]
+
+        prior = [
+            f"Q{row.get('quarter')} {format_money(row.get('actual'))}"
+            for row in reported[1:]
+            if row.get("quarter") and isinstance(row.get("actual"), (int, float))
+        ]
+        if prior:
+            lines.append("*Prior: " + " · ".join(prior) + "*")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------- helpers
 

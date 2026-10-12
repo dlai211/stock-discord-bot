@@ -95,6 +95,42 @@ def to_pacific_clock(hour: int, minute: int, reference: date | None = None) -> s
     return f"{eastern.astimezone(config.PACIFIC):%H:%M}"
 
 
+# Reporting slots, defined on the US/Eastern clock the exchange runs on. The
+# Pacific range shown in the label is derived from them, never typed in.
+TIMING_WINDOWS = {
+    "bmo": ("Pre-Market", 8, 30, 9, 30),
+    "amc": ("Post-Market", 16, 0, 17, 0),
+    "dmh": ("Market Hours", 9, 30, 16, 0),
+}
+
+
+def parse_iso_date(value: Any) -> date | None:
+    """Parse a YYYY-MM-DD string, returning None when it is anything else.
+
+    Both Finnhub and FRED hand back dates as plain strings, and both occasionally
+    leave one blank, so callers can treat a bad value as simply missing.
+    """
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def timing_label(code: str) -> str:
+    """Human-readable reporting slot, e.g. 'Pre-Market (~05:30-06:30 PT)'.
+
+    Returns "" for an unknown or missing code, so callers can simply drop the
+    part rather than having to special-case it.
+    """
+    window = TIMING_WINDOWS.get((code or "").lower())
+    if window is None:
+        return ""
+    name, start_hour, start_minute, end_hour, end_minute = window
+    start = to_pacific_clock(start_hour, start_minute)
+    end = to_pacific_clock(end_hour, end_minute)
+    return f"{name} (~{start}-{end} PT)"
+
+
 async def run_blocking(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Run a blocking call (yfinance, fredapi, finnhub) in a worker thread.
 

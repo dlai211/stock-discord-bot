@@ -37,8 +37,8 @@ stock-discord-bot/
 ├── PRD.md                        # This file
 ├── cogs/
 │   ├── __init__.py
-│   ├── market_commands.py        # /stock, /macro
-│   ├── scheduled_briefings.py    # Monday 08:00 ET briefing, /test_briefing
+│   ├── market_commands.py        # /stock, /macro, /earnings
+│   ├── scheduled_briefings.py    # Monday 08:00 ET briefing + macro calendar, /test_briefing
 │   ├── macro_alerts.py           # FRED release watcher, /test_macro_alert
 │   └── earnings_tracker.py       # /track_earnings watch list, daily 17:30 ET check
 └── state/                        # Runtime cache, created on first run (gitignored)
@@ -184,38 +184,83 @@ in, and the overwhelming majority of names on this calendar report in USD.
 
 #### What gets listed
 
-Two rules, in priority order:
+Only two things:
 
-1. **High-interest names always appear**, whether or not anyone covers them. They
-   are never dropped to satisfy a cap.
-2. **Everything else needs an analyst estimate.** A ticker with no `epsEstimate`
-   is almost always an uncovered micro-cap. These were flooding the listing and
-   crowding out the days that actually mattered.
+1. **The curated 37 high-interest names** (⭐), whether or not anyone covers them.
+2. **Tickers you track** with `/track_earnings`, re-read from
+   `state/tracked_earnings.json` at post time so newly added ones appear without
+   a restart.
+
+Everything else is left out. The calendar runs to 150–250 companies a week, and
+listing them buried the handful of names that actually matter.
+
+An earlier version also admitted any unstarred company that had an analyst
+estimate. That still produced dozens of lines a day, so it was dropped too.
 
 #### Even spread across the week
 
-A per-day cap of **5 lines**, with the weekly budget divided by the number of
-days still to come:
+Filtering this hard removes the need for a line budget. There is no per-day cap
+and no weekly total any more — every listed company appears on its day.
+
+A **1,000-character ceiling per day field** (`DAY_FIELD_BUDGET`) is the only
+limit, and it binds only on a freak day; anything it cuts is reported as
+`*…and N more*`.
+
+A day with scheduled earnings but nothing listed still gets a field reading
+`*No high-interest or tracked companies.*`, so a quiet day can never be mistaken
+for one the code dropped. A day with **no** earnings at all gets no field.
+
+**History worth remembering.** Each day used to take up to 12 lines from a shared
+25-line pool, and the loop `break`-ed once the pool was empty — so a busy Monday
+and Tuesday ended the briefing at Wednesday and Thursday and Friday never
+appeared at all. That was fixed with a fair-share allocation, and the filter has
+since made any cap unnecessary.
+
+#### Macro economic calendar
+
+A `📅 Macro Economic Calendar This Week` field listing tier-1 US releases between
+Monday and Friday, each with its date and its time in Pacific:
 
 ```
-lines_allowed = max(MIN_PER_DAY, min(MAX_PER_DAY, remaining // days_left))
+Wednesday, Oct 14 · CPI Inflation · 05:30 PT
 ```
 
-A heavy Monday therefore cannot spend Friday's allowance, and `MIN_PER_DAY = 1`
-guarantees each remaining day still gets a line once the budget runs out.
+| FRED release name | Shown as | Publishes (ET) |
+|---|---|---|
+| `Consumer Price Index` | CPI Inflation | 08:30 |
+| `Personal Income and Outlays` | Core PCE Price Index | 08:30 |
+| `Gross Domestic Product` | Real GDP | 08:30 |
+| `Employment Situation` | Non-Farm Payrolls | 08:30 |
 
-**This replaced a real bug.** The previous version gave each day up to 12 lines
-out of a shared 25-line pool and then `break`-ed out of the loop once the pool
-was empty — so a busy Monday and Tuesday ended the briefing at Wednesday, and
-Thursday and Friday were missing entirely. The `break` is gone; a day is now
-skipped only when it has no scheduled earnings at all.
+If nothing is scheduled the field reads *"No major tier-1 macro releases
+scheduled this week."* If the FRED call fails it reads *"Unavailable"* instead —
+an empty week and a broken lookup must never look the same.
 
-A day whose reports all lack estimates still gets a field reading
-`*No analyst estimates available*`, so an empty day is never mistaken for a bug.
+**Matching is exact, not substring.** FRED also publishes "Sticky Price CPI",
+"Current Median CPI", "Gross Domestic Product by State" and "Trimmed Mean PCE
+Inflation Rate". A substring match would list all of those as headline prints.
 
-Overflow reads `*…and N more with estimates*`. The word "estimates" matters here:
-the headline company count includes the filtered-out micro-caps, so a bare "and
-2 more" would look wrong next to a count of 201.
+**Times are mapped, not fetched.** FRED publishes release *dates* but no clock
+times, so each release carries the fixed time its issuing agency uses — BLS and
+BEA both publish at 08:30 ET. The Pacific rendering is derived from that and
+anchored to the release's own date, so the correct standard or daylight offset
+applies.
+
+**FOMC is not included, and cannot be sourced from FRED.** FRED's only FOMC
+release is `FOMC Press Release`, which carries a date for *every day of the year*
+(365 in 2026) because it also covers routine speeches and statements, so it
+cannot isolate a rate decision. `DFEDTARU` and the other fed funds target series
+resolve to that same release, and a *future* meeting day cannot be derived from
+anything FRED publishes. Adding FOMC back needs a dated meeting calendar, not a
+data feed.
+
+**Why not Finnhub.** Finnhub's `/calendar/economic` is the natural source and
+carries real times, but it returns **HTTP 403 on a free-tier key** — verified
+directly. FRED is the free alternative, at the cost of the mapped times above.
+
+**Why not fredapi.** The installed `fredapi` exposes no release-calendar method
+(only `search_by_release` and per-series release helpers), so this uses FRED's
+`/releases/dates` REST endpoint directly through `requests`.
 
 ### 5.4 Macro Release Alerts — `cogs/macro_alerts.py`
 
@@ -387,6 +432,35 @@ live Yahoo data when this was added — 17/17 resolve.
 earnings. The earnings detail is the point of the post, so it should stay the
 first thing read; move the field earlier if market context matters more to you.
 
+### 5.9 `/earnings <ticker>` — `cogs/market_commands.py`
+
+An on-demand earnings lookup, independent of the watch list — you can look up
+any ticker without tracking it.
+
+| Field | Source |
+|---|---|
+| Next report date | `earnings_calendar`, 200-day lookahead |
+| Session timing | `hour` → `Pre-Market (~05:30-06:30 PT)` / `Post-Market (~13:00-14:00 PT)` |
+| Consensus EPS and revenue | `epsEstimate`, `revenueEstimate` |
+| Last reported quarter | `company_earnings`, newest first |
+| Surprise | `surprisePercent`, green embed for a beat, red for a miss |
+
+**The next report is sorted, not taken from the first row.** Finnhub returns
+`earnings_calendar` entries *furthest-out first* — a 200-day window for MSFT came
+back as April 2027, January 2027, then October 2026 — so the command takes the
+minimum date rather than trusting the ordering. Reading `[0]` would have
+announced a report eight months away as "next".
+
+**Session timing may be blank.** `hour` is frequently `""` for a report whose
+timing has not been confirmed yet, so the embed says the session is unconfirmed
+rather than guessing.
+
+**A company with no records at all** gets a friendly "Finnhub has no earnings
+records for `X`" rather than an empty embed.
+
+`/earnings` and `/stock` are deliberately separate: one is a calendar lookup, the
+other a price quote, and neither depends on the watch list or on each other.
+
 ---
 
 ## 6. Setup — running locally
@@ -496,6 +570,10 @@ always-on / no-sleep option if that matters to you.
 | Earnings alerts never arrive | Watch list is empty, or the company's actual EPS was not on Finnhub at 17:30 | Check `/list_earnings`; see the known gap in §5.6 |
 | A `[TEST]` post appeared in the channel | Someone ran a test command | Expected — both test commands are open to everyone in the server |
 | `/macro` shows "has not published a full 13-month window" | `CPIAUCSL` is short (early in a series' life, or after an outage) | Nothing to fix; it resolves as FRED publishes |
+| Briefing's macro section says "Unavailable" | FRED's release calendar could not be reached | Check `FRED_API_KEY` and the logs — this is **not** the same as a week with nothing scheduled |
+| No FOMC line in the macro section | FOMC is not sourced at all; FRED cannot date a rate decision | Expected — see §5.3 |
+| `/earnings` says the session is unconfirmed | Finnhub has no `hour` for that report yet | Normal for a report more than a few weeks out |
+| A high-interest name is missing from the briefing | It has no entry in that week's Finnhub calendar | `/earnings <ticker>` shows its actual date |
 
 ---
 
@@ -955,3 +1033,97 @@ mistaken for the filter misfiring.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 92/92 |
+
+### 2026-10-11 19:03 PT — Briefing filtering, macro calendar, and `/earnings`
+
+**Changed — the briefing listing is now strictly curated.** Only the 37
+high-interest names (⭐) and tickers tracked with `/track_earnings` are listed.
+The previous rule also admitted any unstarred company with an analyst estimate,
+which still produced dozens of lines a day. Because the filter is now this
+narrow, the per-day line cap and the weekly total are **gone** — they were only
+ever needed to ration a listing that is no longer large enough to ration. A
+1,000-character field ceiling remains as a backstop.
+
+**Added — `📅 Macro Economic Calendar This Week`**, a tier-1 US release calendar
+for the coming week with each date and time in Pacific. See §5.3.
+
+**Added — `/earnings <ticker>`**, an on-demand lookup for a company's next
+report and last reported quarter. See §5.9.
+
+**Modified**
+- `cogs/scheduled_briefings.py` — filter replaced with `_is_listed()`; added the
+  FRED release-calendar fetch, `tier1_match()`, `_macro_field()`, and
+  `TIER1_RELEASES`.
+- `cogs/market_commands.py` — added `/earnings` plus its two Finnhub fetchers and
+  two text builders.
+- `cogs/earnings_tracker.py` — `_load_watchlist()` made public as
+  `load_watchlist()`, so the briefing reads the same file rather than duplicating
+  the path and format.
+- `utils.py` — `timing_label()` and `TIMING_WINDOWS` moved here from
+  `scheduled_briefings`, since both the briefing and `/earnings` need them;
+  added `parse_iso_date()`.
+- `verify.py` — grown from 92 to **120 checks**.
+
+**Findings — three data-source surprises, all caught before shipping**
+1. **Finnhub's `/calendar/economic` returns HTTP 403.** It is premium-only; the
+   free-tier key cannot use it. This was the natural source and it carries real
+   release times, so the macro section had to be rebuilt on FRED instead.
+2. **FRED cannot supply FOMC rate decisions.** Its only FOMC release,
+   `FOMC Press Release`, carries a date for *every day of the year* — 365 in 2026
+   — because it also covers routine speeches. `DFEDTARU` and the other target
+   series resolve to that same release, and no FRED endpoint reveals a *future*
+   meeting day. **FOMC is therefore not in the section**, and inventing meeting
+   dates was not an option. It needs a dated calendar, not a data feed.
+3. **Finnhub returns `earnings_calendar` entries furthest-out first.** A 200-day
+   window for MSFT came back April 2027 → January 2027 → October 2026. Reading
+   `[0]` would have reported a report eight months away as the next one;
+   `/earnings` takes the minimum date instead.
+
+**Verified**
+- `python verify.py` — **120/120 checks passed**, exit 0.
+- Tier-1 matching asserted to be **exact**: `Sticky Price CPI`,
+  `Gross Domestic Product by State`, `Trimmed Mean PCE Inflation Rate` and
+  `Employment Situation Summary` are all rejected, and `Producer Price Index` is
+  ignored.
+- The macro line is asserted as an **exact string** against the format in the
+  brief: `Tuesday, Oct 13 · CPI Inflation · 05:30 PT`.
+- An **empty week and a failed fetch are asserted to differ** — "No major tier-1
+  macro releases" versus "Unavailable".
+- `/earnings` text builders checked against real Finnhub values: `$2.02` /
+  `$115.33B` consensus, `-0.89%` surprise, and the unconfirmed-session path.
+- Filter checked in both directions: a starred ticker is listed, an unstarred
+  untracked ticker is not, and the same ticker **is** listed once passed in the
+  tracked set — proving tracking does not open the door to others.
+- A 120-entry day asserted to stay inside Discord's 1,024-character field cap and
+  to report what it dropped.
+- **Live checks, three read-only calls** (no Discord, no writes): Finnhub
+  `/calendar/economic` (403), Finnhub `company_earnings` and `earnings_calendar`
+  (both fine), FRED `/releases/dates` across 2026 (CPI 12 dates, Employment
+  Situation 12 dates, FOMC Press Release 365 dates). The rendered briefing was
+  then re-run against the live FRED calendar and produced exactly one tier-1
+  event — `Wednesday, Oct 14 · CPI Inflation · 05:30 PT`, which matches FRED's
+  own CPI schedule for October.
+- `python -m compileall` — exit 0.
+
+**Notes**
+- The tier-1 list is now **four** releases, not the five requested. The missing
+  one is FOMC, for the reason above. Everything needed to add it back is a list
+  of meeting dates.
+- The macro section's times are **conventions, not API data** — 08:30 ET for BLS
+  and BEA releases. If an agency ever shifts its publication time the label will
+  be wrong until `TIER1_RELEASES` is updated.
+- `/test_briefing` renders the macro section unchanged, because it calls the same
+  `_build_embed`; this is asserted rather than assumed.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Market snapshot symbols resolving | 17/17 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 120/120 |
