@@ -911,6 +911,155 @@ async def main() -> int:
         is not None,
     )
 
+    # ---------------------------------------------------- duplicate suppression
+    section("duplicate suppression")
+
+    import tempfile
+    from pathlib import Path as PathClass
+
+    import cogs.earnings_tracker as tracker_module
+    import cogs.macro_alerts as macro_module
+    from cogs.earnings_tracker import EarningsTracker
+    from cogs.macro_alerts import MacroAlerts
+
+    class RecordingChannel:
+        """Stands in for a Discord channel and counts what gets posted."""
+
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs.get("embed"))
+
+    recording = RecordingChannel()
+
+    async def resolve_to_recording_channel(client, channel_id):
+        return recording
+
+    # --- macro release alerts, polled every 15 minutes -----------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        # Redirect the on-disk cache so the real one is never touched.
+        macro_module.STATE_PATH = PathClass(tmp) / "macro_state.json"
+        macro_module.resolve_channel = resolve_to_recording_channel
+
+        september = {
+            "date": date(2026, 9, 1),
+            "value": 325.4,
+            "previous": 324.1,
+            "year_ago": 315.2,
+        }
+        october = {
+            "date": date(2026, 10, 1),
+            "value": 326.9,
+            "previous": 325.4,
+            "year_ago": 316.0,
+        }
+
+        async def returns_september(series_id):
+            return september
+
+        async def returns_october(series_id):
+            return october
+
+        alerts = MacroAlerts(bot=None)
+        alerts._fetch_latest = returns_september
+
+        recording.sent.clear()
+        await alerts._check_for_releases()
+        check(
+            "A first run seeds instead of announcing history",
+            not recording.sent,
+            f"{len(recording.sent)} message(s)",
+        )
+
+        alerts._fetch_latest = returns_october
+        await alerts._check_for_releases()
+        after_new = len(recording.sent)
+        check(
+            "A new period posts exactly once per series that published",
+            after_new == len(MONITORED_SERIES),
+            f"{after_new} message(s) for {len(MONITORED_SERIES)} series",
+        )
+
+        # This is the user-visible worry: polling every 15 minutes must not mean
+        # posting every 15 minutes.
+        for _ in range(3):
+            await alerts._check_for_releases()
+        check(
+            "Three further polls of the same release add nothing",
+            len(recording.sent) == after_new,
+            f"{len(recording.sent)} message(s) after 4 polls, still {after_new}",
+        )
+
+        restarted = MacroAlerts(bot=None)
+        restarted._fetch_latest = returns_october
+        recording.sent.clear()
+        await restarted._check_for_releases()
+        check(
+            "A restart does not replay an announced release",
+            not recording.sent,
+            f"{len(recording.sent)} message(s) after restart",
+        )
+
+    # --- tracked earnings alerts, checked daily -----------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        tracker_module.NOTIFIED_PATH = PathClass(tmp) / "earnings_notified.json"
+        tracker_module.resolve_channel = resolve_to_recording_channel
+
+        async def calendar_with_result(day):
+            return [
+                {
+                    "symbol": "AAPL",
+                    "date": day.isoformat(),
+                    "hour": "amc",
+                    "quarter": 3,
+                    "year": 2026,
+                    "epsActual": 1.91,
+                    "epsEstimate": 1.93,
+                }
+            ]
+
+        tracker = EarningsTracker(bot=None)
+        tracker._watchlist = {"AAPL": {"added": "2026-01-01"}}
+        tracker._fetch_calendar = calendar_with_result
+
+        recording.sent.clear()
+        for _ in range(3):
+            await tracker._check_today()
+        check(
+            "A tracked result is posted once, not on every check",
+            len(recording.sent) == 1,
+            f"{len(recording.sent)} message(s) after 3 checks",
+        )
+
+        restarted_tracker = EarningsTracker(bot=None)
+        restarted_tracker._watchlist = {"AAPL": {"added": "2026-01-01"}}
+        restarted_tracker._fetch_calendar = calendar_with_result
+        recording.sent.clear()
+        await restarted_tracker._check_today()
+        check(
+            "A restart does not repeat a tracked earnings alert",
+            not recording.sent,
+            f"{len(recording.sent)} message(s) after restart",
+        )
+
+    # --- posting-frequency guard --------------------------------------------
+    # Only three loops exist, and each is gated. If a fourth appears, this
+    # fails and someone has to decide whether it can post on every tick.
+    check(
+        "Exactly three background loops are registered",
+        len(loops) == 3,
+        ", ".join(name for name, _ in loops),
+    )
+    check(
+        "No loop posts on a short interval",
+        all(
+            (loop.minutes is None or loop.minutes >= 15)
+            for _, loop in loops
+        ),
+        "the fastest loop is the 15-minute macro poll, which posts only on new data",
+    )
+
     # ----------------------------------------------------------------- summary
     section("summary")
     failed = RESULTS.count(False)

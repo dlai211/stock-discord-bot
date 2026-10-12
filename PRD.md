@@ -35,6 +35,7 @@ stock-discord-bot/
 ├── .env                          # Secrets — gitignored, never logged
 ├── .env.example                  # Template with blank values
 ├── PRD.md                        # This file
+├── COMMANDS.md                   # Short user-facing command reference
 ├── cogs/
 │   ├── __init__.py
 │   ├── market_commands.py        # /stock, /macro, /earnings
@@ -1127,3 +1128,55 @@ report and last reported quarter. See §5.9.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 120/120 |
+
+### 2026-10-12 10:26 PT — Duplicate-suppression tests and a user-facing guide
+
+**Added — `COMMANDS.md`**, a short reference for anyone in the server: the six
+on-demand commands, the three automatic posts and their cadence, the two test
+commands, and a plain-language statement of the no-spam guarantees.
+
+**Added — "duplicate suppression" to `verify.py`.** The posting-frequency
+question had only ever been reasoned about by reading the code. These tests
+drive the real poll loop and count messages, with the on-disk caches redirected
+to a temp directory so the live state is untouched:
+
+| Assertion | Result |
+|---|---|
+| A first run seeds instead of announcing history | 0 messages |
+| A new period posts | one per series that published |
+| Three further polls over the same release | **0 additional messages** |
+| A restart does not replay an announced release | 0 messages |
+| A tracked result is posted once, not on every check | 1 message after 3 checks |
+| A restart does not repeat a tracked earnings alert | 0 messages |
+| Exactly three background loops exist, none on a short interval | pass |
+
+**Verified**
+- `python verify.py` — **128/128 checks passed**, exit 0.
+
+**Note on a failing first run.** The new test initially reported 3 messages
+where it expected 1, which looked like a duplicate-alert bug. It was the *test*
+that was wrong: there are three monitored series, and the stub returned the same
+observation for all three, so all three correctly fired. The assertion now reads
+"one per series that published". Worth recording because the failure mode looked
+convincing.
+
+**Confirming the original question.** Polling every 15 minutes does **not** mean
+posting every 15 minutes. `_check_for_releases` compares each series' newest
+observation date against `state/macro_state.json` and only enqueues a post when
+the date is *strictly newer*; the cache advances only after a send succeeds, so
+a failed post retries rather than being lost. On a day when CPI publishes, the
+channel gets exactly one CPI message, and nothing further however many times the
+bot polls afterwards.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Market snapshot symbols resolving | 17/17 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 128/128 |
