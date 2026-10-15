@@ -34,8 +34,11 @@ def section(title: str) -> None:
     print(f"\n-- {title} ".ljust(60, "-"))
 
 
-async def main() -> int:
+async def main(live: bool = False) -> int:
     print(f"Python {sys.version.split()[0]}   discord.py {discord.__version__}")
+    if not live:
+        print("offline mode — nothing here touches the network")
+        print("pass --live to also fetch every timeframe from Yahoo for real")
 
     # ---------------------------------------------------------- configuration
     section("configuration")
@@ -856,8 +859,11 @@ async def main() -> int:
         DEFAULT_TIMEFRAME,
         TIMEFRAMES,
         ChartUnavailable,
+        generate_stock_chart,
         label_for,
         render_chart,
+        tick_positions,
+        timeframe,
         timeframe_args,
     )
     from cogs.market_commands import StockChartView
@@ -868,15 +874,67 @@ async def main() -> int:
         matplotlib.get_backend(),
     )
     check(
-        "Timeframe buttons match the spec",
-        TIMEFRAMES
-        == (("1D", "1d", "2m"), ("1W", "5d", "15m"), ("1M", "1mo", "1d"), ("1Y", "1y", "1d")),
-        ", ".join(f"{name}={p}/{i}" for name, p, i in TIMEFRAMES),
+        "Timeframes match the spec",
+        [(entry.label, entry.period, entry.interval) for entry in TIMEFRAMES]
+        == [
+            ("1D", "1d", "2m"),
+            ("1W", "5d", "15m"),
+            ("1M", "1mo", "1h"),
+            ("3M", "3mo", "1h"),
+            ("1Y", "1y", "1d"),
+        ],
+        ", ".join(f"{entry.label}={entry.period}/{entry.interval}" for entry in TIMEFRAMES),
+    )
+    check(
+        "Buttons are ordered 1D, 1W, 1M, 3M, 1Y",
+        [entry.label for entry in TIMEFRAMES] == ["1D", "1W", "1M", "3M", "1Y"],
+        " · ".join(entry.label for entry in TIMEFRAMES),
+    )
+    check(
+        "1M and 3M fetch hourly bars, not daily",
+        [timeframe(label).interval for label in ("1M", "3M")] == ["1h", "1h"],
+        ", ".join(f"{label}={timeframe(label).interval}" for label in ("1M", "3M")),
+    )
+    check(
+        "Only 3M declares a daily fallback",
+        [
+            (entry.label, entry.fallback_interval)
+            for entry in TIMEFRAMES
+            if entry.fallback_interval
+        ]
+        == [("3M", "1d")],
+    )
+    check(
+        "Every timeframe declares a tick format",
+        all(entry.tick_format for entry in TIMEFRAMES),
+        ", ".join(f"{entry.label}:{entry.tick_format}" for entry in TIMEFRAMES),
     )
     check("The default timeframe is 1D", DEFAULT_TIMEFRAME == "1D")
     check("A label maps back to its period/interval", timeframe_args("1W") == ("5d", "15m"))
     check("A period/interval maps back to its label", label_for("1y", "1d") == "1Y")
     check("The attachment name is the one the embed points at", CHART_FILENAME == "chart.png")
+
+    # --- x-axis ticks land on bar positions, not on timestamps
+    positions = tick_positions(195)
+    check(
+        "Tick count sits in the brief's 4-6 range",
+        4 <= len(positions) <= 6,
+        f"{len(positions)} ticks for 195 bars",
+    )
+    check(
+        "Ticks span the whole series, first bar to last",
+        positions[0] == 0 and positions[-1] == 194,
+        str(positions),
+    )
+    check(
+        "Ticks are integers inside the series",
+        all(isinstance(value, int) and 0 <= value < 195 for value in positions),
+        str(positions),
+    )
+    spacing = [b - a for a, b in zip(positions, positions[1:])]
+    check("Tick spacing is even", max(spacing) - min(spacing) <= 1, f"gaps={spacing}")
+    check("A short series gets one tick per bar", tick_positions(3) == [0, 1, 2])
+    check("An empty series gets no ticks", tick_positions(0) == [])
 
     def price_frame(values, start="2026-10-13 09:30", freq="2min"):
         index = pd.date_range(start, periods=len(values), freq=freq)
@@ -931,6 +989,55 @@ async def main() -> int:
         == b"\x89PNG",
     )
 
+    # --- market-closure gaps must not become diagonal lines
+    #
+    # A 1Y daily series has ~55 multi-day gaps. Plotted against timestamps, each
+    # one is drawn as a straight diagonal from one close to the next — a line
+    # that never happened. Plotted against bar position, a price step is one bar
+    # wide, so it reads as a near-vertical jump.
+    #
+    # The two cases are separable by measuring how far the line travels
+    # vertically within a single pixel column: a near-vertical step does a whole
+    # move in one column, a diagonal does a sliver per column across hundreds.
+    def tallest_vertical_span(buffer):
+        buffer.seek(0)
+        with Image.open(buffer) as image:
+            pixels = np.asarray(image.convert("RGB")).astype(int)
+        red, green = pixels[:, :, 0], pixels[:, :, 1]
+        mask = (green > 120) & (green > red + 60)
+        tallest = 0
+        for column in range(mask.shape[1]):
+            rows = np.flatnonzero(mask[:, column])
+            if rows.size > 1:
+                tallest = max(tallest, int(rows[-1] - rows[0]))
+        return tallest
+
+    def step_frame(before=200, after=200, gap_hours=120):
+        first = pd.date_range("2026-01-05 09:30", periods=before, freq="1h")
+        second = pd.date_range(
+            first[-1] + pd.Timedelta(hours=gap_hours), periods=after, freq="1h"
+        )
+        close = [100.0] * before + [140.0] * after
+        return pd.DataFrame(
+            {
+                "Open": close,
+                "High": close,
+                "Low": close,
+                "Close": close,
+                "Volume": [1.0] * len(close),
+            },
+            index=first.append(second),
+        )
+
+    step_span = tallest_vertical_span(
+        render_chart("STEP", step_frame(), "1mo", "1h", timeframe("1M"))
+    )
+    check(
+        "A five-day market closure does not become a diagonal",
+        step_span > 100,
+        f"step climbs {step_span}px within one column (a datetime axis gives ~5px)",
+    )
+
     for label, payload in (
         ("empty history", pd.DataFrame()),
         ("history with no Close column", pd.DataFrame({"Open": [1.0, 2.0]})),
@@ -947,27 +1054,28 @@ async def main() -> int:
     # --- the interactive view
     view = StockChartView("AAPL", discord.Embed(title="quote"), DEFAULT_TIMEFRAME)
     buttons = [item for item in view.children if isinstance(item, discord.ui.Button)]
-    check("The view has four buttons", len(buttons) == 4, f"{len(buttons)}")
+    check("The view has five buttons", len(buttons) == 5, f"{len(buttons)}")
     check(
-        "Buttons read 1D, 1W, 1M, 1Y",
-        [button.label for button in buttons] == ["1D", "1W", "1M", "1Y"],
+        "Buttons read 1D, 1W, 1M, 3M, 1Y",
+        [button.label for button in buttons] == ["1D", "1W", "1M", "3M", "1Y"],
         ", ".join(str(button.label) for button in buttons),
     )
     check(
         "Only the active timeframe is highlighted",
         [button.style for button in buttons]
-        == [discord.ButtonStyle.primary] + [discord.ButtonStyle.secondary] * 3,
+        == [discord.ButtonStyle.primary] + [discord.ButtonStyle.secondary] * 4,
         ", ".join(str(button.style) for button in buttons),
     )
     check("The view expires after 180 seconds", view.timeout == 180, str(view.timeout))
 
-    view.active = "1M"
+    view.active = "3M"
     view.sync_buttons()
     moved = [item for item in view.children if isinstance(item, discord.ui.Button)]
     check(
         "The highlight follows the selected timeframe",
         [button.style for button in moved]
         == [
+            discord.ButtonStyle.secondary,
             discord.ButtonStyle.secondary,
             discord.ButtonStyle.secondary,
             discord.ButtonStyle.primary,
@@ -1236,6 +1344,31 @@ async def main() -> int:
         "the fastest loop is the 15-minute macro poll, which posts only on new data",
     )
 
+    # --------------------------------------------------- live fetch, opt-in
+    if live:
+        section("live timeframe fetch (network)")
+        # Everything above proves the *drawing*. This proves the period/interval
+        # pairs are ones Yahoo actually serves — which no offline check can.
+        # Kept behind a flag so the default run stays fast and works anywhere.
+        for entry in TIMEFRAMES:
+            label = f"{entry.label} ({entry.period}/{entry.interval}) fetches and renders"
+            try:
+                buffer = await asyncio.to_thread(
+                    generate_stock_chart,
+                    "AAPL",
+                    entry.period,
+                    entry.interval,
+                    entry.label,
+                )
+                payload = buffer.getvalue()
+                check(
+                    label,
+                    payload[:8] == b"\x89PNG\r\n\x1a\n" and len(payload) > 5_000,
+                    f"{len(payload) / 1024:.0f} KB",
+                )
+            except Exception as error:  # noqa: BLE001 - reporting the failure is the point
+                check(label, False, f"{type(error).__name__}: {error}")
+
     # ----------------------------------------------------------------- summary
     section("summary")
     failed = RESULTS.count(False)
@@ -1244,4 +1377,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(asyncio.run(main(live="--live" in sys.argv)))

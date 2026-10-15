@@ -12,12 +12,12 @@ import io
 import logging
 import threading
 import time
+from typing import NamedTuple
 
 import matplotlib
 
 matplotlib.use("Agg")  # must precede the pyplot import below
 
-import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import yfinance as yf  # noqa: E402
@@ -38,17 +38,13 @@ DOWN_COLOR = "#ff3344"
 AXIS_COLOR = "#b9bbbe"
 TEXT_COLOR = "#ffffff"
 
-# (button label, yfinance period, yfinance interval)
-TIMEFRAMES: tuple[tuple[str, str, str], ...] = (
-    ("1D", "1d", "2m"),
-    ("1W", "5d", "15m"),
-    ("1M", "1mo", "1d"),
-    ("1Y", "1y", "1d"),
-)
-DEFAULT_TIMEFRAME = "1D"
+# X-axis labels to aim for. The brief asks for four to six; five fits this
+# figure width without the labels colliding.
+TICK_COUNT = 5
+DEFAULT_TICK_FORMAT = "%b %d"
 
 # Each button click is a Yahoo request. Caching briefly stops someone flicking
-# through the four timeframes from tripping the rate limit.
+# through the timeframes from tripping the rate limit.
 CACHE_TTL_SECONDS = 45
 CACHE_MAX_ENTRIES = 64
 
@@ -58,50 +54,129 @@ _render_lock = threading.Lock()
 _cache: dict[tuple[str, str, str], tuple[float, bytes]] = {}
 
 
+class Timeframe(NamedTuple):
+    """One timeframe button: what to fetch, and how to label its axis."""
+
+    label: str
+    period: str
+    interval: str
+    tick_format: str
+    fallback_interval: str | None = None
+
+
+TIMEFRAMES: tuple[Timeframe, ...] = (
+    Timeframe("1D", "1d", "2m", "%H:%M"),
+    Timeframe("1W", "5d", "15m", "%b %d"),
+    # Hourly bars, not daily. A month of daily closes is ~21 bare points, which
+    # reads as a zigzag; a month of hourly bars is ~150 and reads as a curve.
+    Timeframe("1M", "1mo", "1h", "%b %d"),
+    Timeframe("3M", "3mo", "1h", "%b %d", fallback_interval="1d"),
+    Timeframe("1Y", "1y", "1d", "%b '%y"),
+)
+DEFAULT_TIMEFRAME = "1D"
+
+
 class ChartUnavailable(Exception):
     """The symbol has no usable price history for the requested window."""
 
 
+def timeframe(label: str) -> Timeframe | None:
+    """The definition behind a button label."""
+    for entry in TIMEFRAMES:
+        if entry.label == label:
+            return entry
+    return None
+
+
+def timeframe_for(period: str, interval: str) -> Timeframe | None:
+    """The definition matching a (period, interval) pair."""
+    for entry in TIMEFRAMES:
+        if (entry.period, entry.interval) == (period, interval):
+            return entry
+    return None
+
+
 def timeframe_args(label: str) -> tuple[str, str]:
     """(period, interval) for a button label."""
-    for name, period, interval in TIMEFRAMES:
-        if name == label:
-            return period, interval
-    raise KeyError(label)
+    entry = timeframe(label)
+    if entry is None:
+        raise KeyError(label)
+    return entry.period, entry.interval
 
 
 def label_for(period: str, interval: str) -> str:
     """The button label matching a (period, interval) pair, for titling."""
-    for name, known_period, known_interval in TIMEFRAMES:
-        if (known_period, known_interval) == (period, interval):
-            return name
-    return period
+    entry = timeframe_for(period, interval)
+    return entry.label if entry else period
 
 
-def generate_stock_chart(symbol: str, period: str, interval: str) -> io.BytesIO:
+def tick_positions(count: int, wanted: int = TICK_COUNT) -> list[int]:
+    """Evenly spaced bar positions for the x-axis, both ends included.
+
+    Positions, not timestamps: the axis is indexed by bar, so ticks land evenly
+    whatever gaps the calendar holds.
+    """
+    if count <= 0:
+        return []
+    if count <= wanted:
+        return list(range(count))
+    return sorted({int(round(value)) for value in np.linspace(0, count - 1, wanted)})
+
+
+def generate_stock_chart(
+    symbol: str, period: str, interval: str, label: str | None = None
+) -> io.BytesIO:
     """Fetch history for `symbol` and render it as a PNG.
 
     Returns a BytesIO positioned at index 0. Raises ChartUnavailable when there
     is nothing worth plotting. Blocking — call it via `utils.run_blocking()`.
+
+    `label` names the button this chart belongs to and decides the title and the
+    tick format; without it they are inferred from period/interval.
     """
+    entry = timeframe(label) if label else timeframe_for(period, interval)
     key = (symbol.upper(), period, interval)
     cached = _cache.get(key)
     if cached is not None and time.monotonic() - cached[0] < CACHE_TTL_SECONDS:
         return io.BytesIO(cached[1])
 
     history = yf.Ticker(symbol).history(period=period, interval=interval)
-    png = render_chart(symbol, history, period, interval).getvalue()
+    try:
+        buffer = render_chart(symbol, history, period, interval, entry)
+    except ChartUnavailable:
+        fallback = entry.fallback_interval if entry else None
+        if fallback is None:
+            raise
+        # Yahoo has no intraday bars this far back for some symbols and none at
+        # all for thinly traded ones. Daily closes beat no chart.
+        log.info(
+            "No %s bars for %s over %s — retrying at %s",
+            interval,
+            symbol,
+            period,
+            fallback,
+        )
+        history = yf.Ticker(symbol).history(period=period, interval=fallback)
+        buffer = render_chart(symbol, history, period, fallback, entry)
+
+    png = buffer.getvalue()
 
     if len(_cache) >= CACHE_MAX_ENTRIES:
         # Drop the oldest entry rather than maintaining a full LRU.
-        oldest = min(_cache, key=lambda entry: _cache[entry][0])
+        oldest = min(_cache, key=lambda existing: _cache[existing][0])
         _cache.pop(oldest, None)
     _cache[key] = (time.monotonic(), png)
 
     return io.BytesIO(png)
 
 
-def render_chart(symbol: str, history, period: str, interval: str) -> io.BytesIO:
+def render_chart(
+    symbol: str,
+    history,
+    period: str,
+    interval: str,
+    entry: Timeframe | None = None,
+) -> io.BytesIO:
     """Draw a chart from an already-fetched price history.
 
     Split out from the fetch so it can be exercised offline, with a synthetic
@@ -126,6 +201,12 @@ def render_chart(symbol: str, history, period: str, interval: str) -> io.BytesIO
     color = UP_COLOR if latest >= opening else DOWN_COLOR
 
     values = closes.to_numpy(dtype=float)
+
+    # Plotted against bar position rather than timestamps. A datetime axis draws
+    # a straight diagonal across every weekend and overnight close — a 1Y daily
+    # series has ~55 such gaps, each one a line that never happened.
+    positions = np.arange(len(values), dtype=float)
+
     lowest = float(values.min())
     highest = float(values.max())
     if highest <= lowest:
@@ -134,21 +215,29 @@ def render_chart(symbol: str, history, period: str, interval: str) -> io.BytesIO
     span = highest - lowest
     floor = lowest - span * 0.08
     ceiling = highest + span * 0.08
+    left = positions[0] - 0.5
+    right = positions[-1] + 0.5
+
+    title_label = entry.label if entry else label_for(period, interval)
+    tick_format = entry.tick_format if entry else DEFAULT_TICK_FORMAT
 
     with _render_lock:
         figure, axes = plt.subplots(figsize=(9, 3.6), dpi=140)
         figure.patch.set_facecolor(BACKGROUND)
         axes.set_facecolor(BACKGROUND)
-        axes.set_ylim(floor, ceiling)
 
-        _fill_gradient(axes, closes.index, values, floor, ceiling - floor, color)
-        axes.plot(closes.index, values, color=color, linewidth=1.6, zorder=3)
+        _fill_gradient(axes, positions, values, floor, ceiling - floor, left, right, color)
+        axes.plot(positions, values, color=color, linewidth=1.6, zorder=3)
+
         # Set after the fill: imshow rescales the axes to its own extent.
+        axes.set_xlim(left, right)
         axes.set_ylim(floor, ceiling)
 
-        locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
-        axes.xaxis.set_major_locator(locator)
-        axes.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ticks = tick_positions(len(values))
+        axes.set_xticks(ticks)
+        axes.set_xticklabels(
+            [closes.index[int(position)].strftime(tick_format) for position in ticks]
+        )
 
         axes.grid(True, linestyle="--", alpha=0.2, color=TEXT_COLOR, linewidth=0.6)
         axes.set_axisbelow(True)
@@ -161,7 +250,7 @@ def render_chart(symbol: str, history, period: str, interval: str) -> io.BytesIO
         subtitle = f"{format_money(latest)}  ({change:+,.2f}, {percent:+.2f}%)"
         escaped = subtitle.replace("$", "\\$")
         axes.set_title(
-            f"{symbol.upper()}  ·  {label_for(period, interval)}\n{escaped}",
+            f"{symbol.upper()}  ·  {title_label}\n{escaped}",
             color=TEXT_COLOR,
             fontsize=11,
             loc="left",
@@ -182,20 +271,26 @@ def render_chart(symbol: str, history, period: str, interval: str) -> io.BytesIO
     return buffer
 
 
-def _fill_gradient(axes, index, values, baseline: float, height: float, color: str) -> None:
+def _fill_gradient(
+    axes,
+    positions,
+    values,
+    baseline: float,
+    height: float,
+    left: float,
+    right: float,
+    color: str,
+) -> None:
     """Draw a faint fade beneath the price line.
 
     Painted as one vertical ramp, clipped to the polygon under the curve.
     Stacking fill_between() bands is the obvious alternative, but every band
     boundary is an alpha step, and wherever the curve rises above that boundary
-    the step shows as a hard horizontal seam — very visible on a short series
-    like a 1M chart, where the line only has ~22 points.
+    the step shows as a hard horizontal seam — very visible on a short series.
     """
-    x = mdates.date2num(index)
-
     # Close the polygon: along the curve, then back along the baseline.
-    vertices = list(zip(x, values))
-    vertices += [(x[-1], baseline), (x[0], baseline)]
+    vertices = list(zip(positions, values))
+    vertices += [(positions[-1], baseline), (positions[0], baseline)]
     clip = PathPatch(
         MplPath(vertices), facecolor="none", edgecolor="none", transform=axes.transData
     )
@@ -206,7 +301,7 @@ def _fill_gradient(axes, index, values, baseline: float, height: float, color: s
     )
     image = axes.imshow(
         np.linspace(0.0, 1.0, 256).reshape(-1, 1),
-        extent=[x[0], x[-1], baseline, baseline + height],
+        extent=[left, right, baseline, baseline + height],
         aspect="auto",
         origin="lower",
         cmap=fade,

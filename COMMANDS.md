@@ -8,7 +8,7 @@ Type these any time. Every one replies privately — only you see the answer.
 
 | Command | What you get |
 |---|---|
-| `/stock <ticker>` | Price chart with **1D / 1W / 1M / 1Y** buttons, plus open, day range, volume and market cap. |
+| `/stock <ticker>` | Price chart with **1D / 1W / 1M / 3M / 1Y** buttons, plus open, day range, volume and market cap. |
 | `/macro` | Fed funds rate, 10Y and 2Y Treasury yields, the 10Y–2Y spread, and headline CPI inflation year over year. |
 | `/earnings <ticker>` | Next scheduled report (date + Pre-Market/Post-Market) and the last reported quarter, actual vs consensus. |
 | `/track_earnings <ticker>` | Adds a ticker to the earnings watch list. |

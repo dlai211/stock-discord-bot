@@ -469,14 +469,43 @@ other a price quote, and neither depends on the watch list or on each other.
 
 ### 5.10 Stock chart — `charting.py` + `StockChartView`
 
-`/stock` attaches a price chart and four timeframe buttons.
+`/stock` attaches a price chart and five timeframe buttons.
 
-| Button | yfinance period | interval | Rows for AAPL |
-|---|---|---|---|
-| `1D` | `1d` | `2m` | ~195 |
-| `1W` | `5d` | `15m` | ~130 |
-| `1M` | `1mo` | `1d` | ~22 |
-| `1Y` | `1y` | `1d` | ~251 |
+| Button | yfinance period | interval | Bars for AAPL | Tick labels |
+|---|---|---|---|---|
+| `1D` | `1d` | `2m` | ~195 | `%H:%M` |
+| `1W` | `5d` | `15m` | ~130 | `%b %d` |
+| `1M` | `1mo` | `1h` | ~154 | `%b %d` |
+| `3M` | `3mo` | `1h` (falls back to `1d`) | ~455 | `%b %d` |
+| `1Y` | `1y` | `1d` | ~251 | `%b '%y` |
+
+#### Continuous trading-period axis
+
+The x-axis is **bar position**, not timestamps. Plotting against a datetime scale
+draws a straight diagonal across every market closure — a line that never
+happened. A 1Y daily series has ~55 such gaps; 3M hourly has ~13.
+
+`x = np.arange(len(df))`, so a weekend costs one bar of horizontal space instead
+of two days of it. A price step reads as a near-vertical jump rather than a long
+shallow slope.
+
+Ticks are five evenly spaced integer positions across `range(len(df))`, labelled
+from the real index at those positions. `tick_positions()` is a pure function and
+is unit-tested. A datetime axis does the opposite — ticks evenly spaced in
+*time* — which bunches labels wherever the data is dense.
+
+#### Why 1M and 3M are hourly
+
+A month of daily closes is ~21 points: a zigzag with each day's intraday range
+invisible. A month of hourly bars is ~154 and reads as a curve. Likewise 3M is 65
+daily points versus 455 hourly. Both verified against live data — 7 bars per
+trading day, no missing days, so the finer interval costs nothing in fidelity.
+
+**3M falls back to daily bars.** Yahoo has no hourly history this far back for
+some symbols, and none at all for thinly traded ones. On a `ChartUnavailable` the
+fetch retries at `1d` rather than failing — daily closes beat no chart. The
+button label and tick format still come from the `3M` definition, so the title
+stays right through the fallback.
 
 #### Headless rendering
 
@@ -1331,3 +1360,76 @@ bot polls afterwards.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 152/152 |
+
+### 2026-10-15 00:56 PT — Continuous chart axis, finer bars, and a 3M timeframe
+
+**Fixed — market closures were drawn as lines that never happened.**
+The chart plotted `Close` against a datetime index, so matplotlib connected
+Friday's close to Monday's open with a straight diagonal across the weekend.
+This was not a rare edge case: a 1Y daily series has **~55** such gaps, 3M hourly
+has ~13, and 1M hourly has 4.
+
+The x-axis is now **bar position** (`np.arange(len(values))`), so a closure costs
+one bar of horizontal space rather than two days of it.
+
+**Changed — 1M and 3M now fetch hourly bars.** A month of daily closes is ~21
+points, a zigzag with every day's intraday range erased. Hourly gives ~154; 3M
+goes from 65 points to ~455. Verified against live data that the hourly series is
+complete — 7 bars per trading day, no missing days — so the finer interval does
+not buy detail at the cost of holes.
+
+**Added — a `3M` button**, between `1M` and `1Y`, taking the view to five. 3M
+declares `fallback_interval="1d"`: if Yahoo has no hourly history that far back,
+or none at all for a thinly traded symbol, the fetch retries at daily rather than
+failing. The label and tick format still come from the `3M` definition, so the
+title reads `3M` even when the bars behind it are daily.
+
+**Changed — tick labels are chosen per timeframe** rather than by matplotlib's
+date locator: `%H:%M` for 1D, `%b %d` for 1W/1M/3M, `%b '%y` for 1Y. Five evenly
+spaced bar positions, ends included.
+
+**Added — `verify.py --live`.** The suite stays offline by default; the flag adds
+a section that fetches and renders all five timeframes against real Yahoo data.
+A network-dependent default would make the gate fail on a plane or behind a rate
+limit, where a red result says nothing about the code.
+
+**Verified**
+- `python verify.py` — **163/163 checks passed**, exit 0.
+- `python verify.py --live` — **168/168**, with all five timeframes fetching and
+  rendering live: 1D 61 KB, 1W 66 KB, 1M 75 KB, 3M 72 KB, 1Y 68 KB.
+- **The gap fix is asserted, not eyeballed.** A synthetic 400-bar series with a
+  five-day hole and a price step is rendered, and the image is decoded to measure
+  how far the line travels vertically *within a single pixel column*. A
+  near-vertical step does the whole move in one column (~330px), a diagonal does a
+  sliver per column across hundreds (~5px). The check requires >100px, so it
+  fails if anyone reintroduces a datetime axis.
+- `tick_positions()` unit-tested: 4–6 ticks, spanning first bar to last, integer,
+  evenly spaced within rounding, one-per-bar for short series, none for empty.
+- Timeframe table asserted: five buttons in the order `1D 1W 1M 3M 1Y`, 1M and 3M
+  both `1h`, only 3M declaring a fallback, every timeframe declaring a tick
+  format.
+- View asserted to hold five buttons, `primary` for the active one and
+  `secondary` for the other four, moving correctly when the selection changes.
+- Rendered all three real timeframes (1M/3M/1Y AAPL) and inspected them.
+
+**One thing that looked like a bug and was not.** The 3M chart showed a near
+vertical drop to ~301 just past the Aug 06 label. Rather than assume, I checked
+Yahoo's raw data for holes: the hourly series is perfectly regular (7 bars every
+trading day, 65/65 days), and the daily closes show AAPL going **333.14 on Jul 30
+to 308.64 on Jul 31** — a real ~7% earnings move, faithfully drawn. Worth
+recording because a genuine ~7% single-day move looks exactly like a rendering
+fault.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Chart timeframes resolved live | 5/5 |
+| Headless matplotlib backend | Agg |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 163/163 (168/168 with `--live`) |

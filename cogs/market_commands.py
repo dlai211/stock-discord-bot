@@ -126,9 +126,14 @@ class StockChartView(discord.ui.View):
 
     def sync_buttons(self) -> None:
         self.clear_items()
-        for label, period, interval in TIMEFRAMES:
+        for entry in TIMEFRAMES:
             self.add_item(
-                TimeframeButton(label, period, interval, active=label == self.active)
+                TimeframeButton(
+                    entry.label,
+                    entry.period,
+                    entry.interval,
+                    active=entry.label == self.active,
+                )
             )
 
     def chart_embed(self) -> discord.Embed:
@@ -150,7 +155,7 @@ class StockChartView(discord.ui.View):
 
         try:
             buffer = await run_blocking(
-                generate_stock_chart, self.symbol, period, interval
+                generate_stock_chart, self.symbol, period, interval, label
             )
         except ChartUnavailable as error:
             await interaction.followup.send(
@@ -243,8 +248,9 @@ class MarketCommands(commands.Cog):
         base_embed = self._quote_embed(symbol, info)
 
         try:
+            period, interval = timeframe_args(DEFAULT_TIMEFRAME)
             buffer = await run_blocking(
-                generate_stock_chart, symbol, *timeframe_args(DEFAULT_TIMEFRAME)
+                generate_stock_chart, symbol, period, interval, DEFAULT_TIMEFRAME
             )
         except Exception:
             # The chart is an extra; the quote is the point. A rendering or
