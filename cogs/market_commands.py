@@ -14,6 +14,14 @@ from discord.ext import commands
 from fredapi import Fred
 
 import config
+from charting import (
+    CHART_FILENAME,
+    DEFAULT_TIMEFRAME,
+    TIMEFRAMES,
+    ChartUnavailable,
+    generate_stock_chart,
+    timeframe_args,
+)
 from utils import (
     format_compact,
     format_money,
@@ -31,6 +39,9 @@ COLOR_UP = discord.Color(0x2ECC71)
 COLOR_DOWN = discord.Color(0xE74C3C)
 COLOR_NEUTRAL = discord.Color(0x5865F2)
 COLOR_ERROR = discord.Color(0xED4245)
+
+# How long the timeframe buttons stay live after a chart is posted.
+CHART_VIEW_TIMEOUT = 180
 
 FRED_SERIES = {
     "FEDFUNDS": "Effective Federal Funds Rate",
@@ -72,6 +83,105 @@ def _first(mapping: dict[str, Any], *keys: str) -> Any:
         if value is not None:
             return value
     return None
+
+
+class TimeframeButton(discord.ui.Button):
+    """One timeframe button; the style marks which one is showing."""
+
+    def __init__(self, label: str, period: str, interval: str, active: bool) -> None:
+        super().__init__(
+            label=label,
+            style=(
+                discord.ButtonStyle.primary
+                if active
+                else discord.ButtonStyle.secondary
+            ),
+        )
+        self.period = period
+        self.interval = interval
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if isinstance(view, StockChartView):
+            await view.show_timeframe(
+                interaction, self.label or "", self.period, self.interval
+            )
+
+
+class StockChartView(discord.ui.View):
+    """The 1D / 1W / 1M / 1Y buttons underneath a chart."""
+
+    def __init__(
+        self,
+        symbol: str,
+        base_embed: discord.Embed,
+        active: str = DEFAULT_TIMEFRAME,
+    ) -> None:
+        super().__init__(timeout=CHART_VIEW_TIMEOUT)
+        self.symbol = symbol
+        # Kept without an image so each redraw starts from a clean copy.
+        self.base_embed = base_embed
+        self.active = active
+        self.sync_buttons()
+
+    def sync_buttons(self) -> None:
+        self.clear_items()
+        for label, period, interval in TIMEFRAMES:
+            self.add_item(
+                TimeframeButton(label, period, interval, active=label == self.active)
+            )
+
+    def chart_embed(self) -> discord.Embed:
+        embed = self.base_embed.copy()
+        embed.set_image(url=f"attachment://{CHART_FILENAME}")
+        return embed
+
+    async def show_timeframe(
+        self,
+        interaction: discord.Interaction,
+        label: str,
+        period: str,
+        interval: str,
+    ) -> None:
+        # Deferred before anything slow: Discord only gives a component
+        # interaction three seconds to be acknowledged, and a chart render plus
+        # a Yahoo round trip will often exceed that.
+        await interaction.response.defer()
+
+        try:
+            buffer = await run_blocking(
+                generate_stock_chart, self.symbol, period, interval
+            )
+        except ChartUnavailable as error:
+            await interaction.followup.send(
+                f"No {label} chart for `{self.symbol}` — {error}", ephemeral=True
+            )
+            return
+        except Exception:
+            log.exception("Chart render failed for %s (%s)", self.symbol, period)
+            await interaction.followup.send(
+                "Couldn't build that chart. Check the bot logs.", ephemeral=True
+            )
+            return
+
+        self.active = label
+        self.sync_buttons()
+
+        await interaction.edit_original_response(
+            embed=self.chart_embed(),
+            attachments=[discord.File(buffer, filename=CHART_FILENAME)],
+            view=self,
+        )
+
+    async def on_timeout(self) -> None:
+        # Discord leaves expired buttons looking clickable, so grey them out.
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            log.debug("Could not grey out expired chart buttons", exc_info=True)
 
 
 class MarketCommands(commands.Cog):
@@ -130,7 +240,25 @@ class MarketCommands(commands.Cog):
             )
             return
 
-        await interaction.followup.send(embed=self._quote_embed(symbol, info))
+        base_embed = self._quote_embed(symbol, info)
+
+        try:
+            buffer = await run_blocking(
+                generate_stock_chart, symbol, *timeframe_args(DEFAULT_TIMEFRAME)
+            )
+        except Exception:
+            # The chart is an extra; the quote is the point. A rendering or
+            # Yahoo failure must not cost the whole command.
+            log.exception("Chart render failed for %s; posting the quote alone", symbol)
+            await interaction.followup.send(embed=base_embed)
+            return
+
+        view = StockChartView(symbol, base_embed, DEFAULT_TIMEFRAME)
+        await interaction.followup.send(
+            embed=view.chart_embed(),
+            file=discord.File(buffer, filename=CHART_FILENAME),
+            view=view,
+        )
 
     @staticmethod
     async def _fetch_quote(symbol: str) -> dict[str, Any]:
@@ -161,6 +289,7 @@ class MarketCommands(commands.Cog):
         exchange = info.get("fullExchangeName") or info.get("exchange")
 
         price = _first(info, "currentPrice", "regularMarketPrice", "previousClose")
+        open_price = _first(info, "open", "regularMarketOpen")
         previous_close = _first(info, "previousClose", "regularMarketPreviousClose")
         day_high = _first(info, "dayHigh", "regularMarketDayHigh")
         day_low = _first(info, "dayLow", "regularMarketDayLow")
@@ -192,6 +321,7 @@ class MarketCommands(commands.Cog):
             embed.description = f"*{exchange}*"
 
         embed.add_field(name="Price", value=f"**{format_money(price, currency)}**", inline=True)
+        embed.add_field(name="Open", value=format_money(open_price, currency), inline=True)
         embed.add_field(name="Daily change", value=change_text, inline=True)
         embed.add_field(name="Previous close", value=format_money(previous_close, currency), inline=True)
         embed.add_field(name="Day range", value=day_range, inline=True)

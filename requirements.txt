@@ -7,6 +7,10 @@ python-dotenv>=1.0.0
 # Market quotes (/stock)
 yfinance>=0.2.30
 
+# Stock chart rendering (/stock). Forced onto the Agg backend — a headless host
+# has no display server, and importing pyplot with a GUI backend raises there.
+matplotlib>=3.9.0
+
 # Economic data from the St. Louis Fed (/macro, macro alerts)
 fredapi>=0.5.0
 

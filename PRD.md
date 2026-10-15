@@ -29,6 +29,7 @@ stock-discord-bot/
 ├── bot.py                        # Entry point: builds the Bot, loads cogs, syncs the command tree
 ├── config.py                     # The only module that reads .env
 ├── utils.py                      # Formatting, async/retry, atomic JSON helpers
+├── charting.py                   # Matplotlib chart rendering (Agg backend only)
 ├── verify.py                     # Offline smoke test: loads every cog without connecting
 ├── requirements.txt
 ├── Procfile                      # Hosting entry point (worker: python bot.py)
@@ -127,6 +128,7 @@ expected and shown per-series in the `/macro` embed.
 |---|---|---|
 | Name | `longName` | `shortName`, then the raw symbol |
 | Price + currency | `currentPrice` | `regularMarketPrice`, `previousClose` |
+| Open | `open` | `regularMarketOpen` |
 | Daily change ($ / %) | computed from price − `previousClose` | — |
 | Day range | `dayHigh` / `dayLow` | `regularMarketDayHigh` / `...Low` |
 | Volume | `volume` | `regularMarketVolume` |
@@ -135,6 +137,9 @@ expected and shown per-series in the `/macro` embed.
 Embed colour is green when the daily change is positive, red when negative.
 Unknown or delisted symbols produce a friendly ephemeral message rather than a
 traceback.
+
+A **chart image** is attached and the message carries four timeframe buttons.
+See §5.10.
 
 ### 5.2 `/macro` — `cogs/market_commands.py`
 
@@ -461,6 +466,73 @@ records for `X`" rather than an empty embed.
 
 `/earnings` and `/stock` are deliberately separate: one is a calendar lookup, the
 other a price quote, and neither depends on the watch list or on each other.
+
+### 5.10 Stock chart — `charting.py` + `StockChartView`
+
+`/stock` attaches a price chart and four timeframe buttons.
+
+| Button | yfinance period | interval | Rows for AAPL |
+|---|---|---|---|
+| `1D` | `1d` | `2m` | ~195 |
+| `1W` | `5d` | `15m` | ~130 |
+| `1M` | `1mo` | `1d` | ~22 |
+| `1Y` | `1y` | `1d` | ~251 |
+
+#### Headless rendering
+
+`matplotlib.use("Agg")` runs **before** `import matplotlib.pyplot`. A headless
+Linux host has no display server, and importing pyplot with a GUI backend
+selected raises at import time — which would stop the bot from starting at all,
+not merely break the chart. `verify.py` asserts the backend resolves to `agg`.
+
+#### What it draws
+
+- Background `#2f3136` — Discord's own surface, so the image sits flush in an embed.
+- Line `#00ff88` when the latest close is at or above the period's **opening**
+  price, `#ff3344` otherwise.
+- A vertical fade beneath the line, strongest just under it.
+- Dashed grid at `alpha=0.2`, no spines, quiet grey ticks.
+- A left-aligned title: `SYMBOL · TIMEFRAME` above price and change.
+
+#### Three things that were not obvious
+
+**The currency symbol has to be escaped.** matplotlib reads a *pair* of `$` as
+mathtext, so `$342.96 (+12.82, +3.88%)` renders as italic maths. The subtitle is
+escaped to `\$` before it reaches the title.
+
+**Stacked gradient bands leave seams.** The first attempt approximated the fade
+with 14 horizontal `fill_between` bands. Each band boundary is an alpha step, and
+wherever the curve rises above that boundary the step shows as a hard horizontal
+line — glaring on a 1M chart, where the line has only ~22 points. It is now a
+single `imshow` ramp clipped to the polygon under the curve.
+
+**pyplot keeps global figure state.** Two renders on different threads can tread
+on each other, so rendering is serialised behind a module lock. Charts are small
+and infrequent; the lock costs nothing.
+
+#### Request cost and caching
+
+Every button click is a Yahoo request, so rendered PNGs are cached for **45
+seconds**, keyed on (symbol, period, interval) and capped at 64 entries. Flicking
+through all four timeframes twice costs four requests, not eight.
+
+#### Interaction
+
+`show_timeframe()` calls `await interaction.response.defer()` **before** anything
+slow. Discord allows three seconds to acknowledge a component interaction, and a
+render plus a Yahoo round trip will often exceed that. It then renders off the
+event loop via `run_blocking`, and finishes with
+`edit_original_response(embed=..., attachments=[file], view=self)`.
+
+The active timeframe is `ButtonStyle.primary`; the rest are `secondary`. The view
+times out after **180 seconds**, and `on_timeout` greys the buttons out so they
+do not keep looking clickable after they have stopped working.
+
+**If the chart fails the quote still posts.** Chart generation is wrapped so a
+render or Yahoo failure costs the image, not the command.
+
+**Button access is open** — anyone who can see the message can change the
+timeframe. Fine for public market data, and consistent with the rest of the bot.
 
 ---
 
@@ -1180,3 +1252,82 @@ bot polls afterwards.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 128/128 |
+
+### 2026-10-15 00:38 PT — Charts on `/stock`
+
+**Added**
+- `charting.py` — `generate_stock_chart(symbol, period, interval) -> io.BytesIO`
+  and `render_chart()`, the pure drawing half, split out so it can be exercised
+  offline. See §5.10.
+- `StockChartView` and `TimeframeButton` in `cogs/market_commands.py` — four
+  timeframe buttons, 180-second timeout, active button highlighted.
+- `matplotlib>=3.9.0` in `requirements.txt` (resolved to 3.11.2).
+
+**Modified**
+- `cogs/market_commands.py` — `/stock` now attaches a chart and the button view,
+  and the quote embed gained an **Open** field.
+- `verify.py` — grown from 128 to **152 checks**.
+
+**Two corrections to the brief**
+1. **`/stock` does not use Finnhub.** It reads quotes from `yfinance` (Yahoo);
+   Finnhub is used only by `/earnings`. Confirmed by reading the code before
+   starting. Per the answer given, quotes stay on yfinance — Yahoo supplies the
+   company name and market cap the embed shows, neither of which Finnhub's free
+   `/quote` returns.
+2. **There was no Open field.** The brief listed "(Open, High, Low, Previous
+   Close, Volume)" as existing fields; the embed actually had Price, Daily
+   change, Previous close, Day range, Volume, Market cap. High and Low are shown
+   as a combined "Day range", and Open was genuinely missing, so it was added.
+   A test now pins the exact field list so nothing can be silently dropped.
+
+**Verified**
+- `python verify.py` — **152/152 checks passed**, exit 0.
+- **The PNG is really a PNG**: the buffer's first eight bytes are checked against
+  the PNG magic number, and the buffer is asserted to come back rewound to index
+  0 (a buffer left at the end would upload as an empty file).
+- **The line colour is checked by reading pixels**, not by trusting a variable.
+  The rendered image is decoded and clearly-green pixels are counted against
+  clearly-red ones: an up period must be green-dominant, a down period
+  red-dominant.
+- Degenerate inputs are asserted to raise `ChartUnavailable` rather than render
+  something broken: empty history, a frame with no `Close` column, and a
+  single-point series. A perfectly flat series is asserted to still render.
+- The view is checked for four buttons, the right labels, exactly one
+  `primary`/three `secondary`, a 180-second timeout, that the highlight follows
+  a selection, and that `chart_embed()` points at `attachment://chart.png` while
+  the base embed stays imageless so redraws start clean.
+- **Live check, all twelve combinations** (AAPL, `^TNX`, BTC-USD × four
+  timeframes) fetched real history and rendered real PNGs — 53–72 KB each, well
+  under Discord's 8 MB attachment limit. Everything the offline suite cannot
+  reach.
+
+**Found by looking at the output, not by a test**
+- The first gradient implementation stacked 14 `fill_between` bands. On a
+  synthetic 200-point series it looked fine. Rendered against **real** AAPL 1M
+  data — 22 points — it showed unmistakable horizontal seams under every peak,
+  because each band boundary is an alpha step. Replaced with a single `imshow`
+  ramp clipped to the polygon; confirmed visually against the same live data.
+  Worth recording because the offline tests passed both versions.
+
+**Notes**
+- Chart failures are non-fatal: `/stock` still posts the quote, without an image.
+- Rendered charts are cached for 45 seconds, so flicking through the timeframes
+  does not burn a Yahoo request per click.
+- `matplotlib` needs no system libraries on Linux (the manylinux wheel bundles
+  what it needs) and needs no display with Agg, so the Procfile deployment is
+  unchanged — the build is simply larger and slower.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Market snapshot symbols resolving | 17/17 |
+| Chart timeframes resolved live | 12/12 |
+| Headless matplotlib backend | Agg |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 152/152 |

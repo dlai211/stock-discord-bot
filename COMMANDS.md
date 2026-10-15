@@ -8,7 +8,7 @@ Type these any time. Every one replies privately — only you see the answer.
 
 | Command | What you get |
 |---|---|
-| `/stock <ticker>` | Price, daily change, day range, volume, market cap. |
+| `/stock <ticker>` | Price chart with **1D / 1W / 1M / 1Y** buttons, plus open, day range, volume and market cap. |
 | `/macro` | Fed funds rate, 10Y and 2Y Treasury yields, the 10Y–2Y spread, and headline CPI inflation year over year. |
 | `/earnings <ticker>` | Next scheduled report (date + Pre-Market/Post-Market) and the last reported quarter, actual vs consensus. |
 | `/track_earnings <ticker>` | Adds a ticker to the earnings watch list. |
@@ -58,6 +58,9 @@ never announced twice:
   exchange clock) and are converted for display.
 - **Quotes may be delayed.** Market data comes from Yahoo Finance via `yfinance`
   and is not real-time exchange data.
+- **The chart's timeframe buttons stay live for three minutes.** After that they
+  grey out — run `/stock` again to get a fresh chart. Anyone who can see the
+  message can press them.
 - **The weekly briefing only lists high-interest names and your own tracked
   tickers.** Roughly 150–250 companies report each week; listing them all would
   bury the ones that matter. Use `/track_earnings` to add anything it misses.

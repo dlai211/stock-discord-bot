@@ -844,6 +844,182 @@ async def main() -> int:
         hex(lookup_embed.color.value),
     )
 
+    # ------------------------------------------------------------ stock charts
+    section("stock charts")
+
+    import matplotlib
+    import numpy as np
+    from PIL import Image
+
+    from charting import (
+        CHART_FILENAME,
+        DEFAULT_TIMEFRAME,
+        TIMEFRAMES,
+        ChartUnavailable,
+        label_for,
+        render_chart,
+        timeframe_args,
+    )
+    from cogs.market_commands import StockChartView
+
+    check(
+        "Matplotlib runs headless on the Agg backend",
+        matplotlib.get_backend().lower() == "agg",
+        matplotlib.get_backend(),
+    )
+    check(
+        "Timeframe buttons match the spec",
+        TIMEFRAMES
+        == (("1D", "1d", "2m"), ("1W", "5d", "15m"), ("1M", "1mo", "1d"), ("1Y", "1y", "1d")),
+        ", ".join(f"{name}={p}/{i}" for name, p, i in TIMEFRAMES),
+    )
+    check("The default timeframe is 1D", DEFAULT_TIMEFRAME == "1D")
+    check("A label maps back to its period/interval", timeframe_args("1W") == ("5d", "15m"))
+    check("A period/interval maps back to its label", label_for("1y", "1d") == "1Y")
+    check("The attachment name is the one the embed points at", CHART_FILENAME == "chart.png")
+
+    def price_frame(values, start="2026-10-13 09:30", freq="2min"):
+        index = pd.date_range(start, periods=len(values), freq=freq)
+        return pd.DataFrame(
+            {
+                "Open": list(values),
+                "High": [value * 1.002 for value in values],
+                "Low": [value * 0.998 for value in values],
+                "Close": list(values),
+                "Volume": [1000.0] * len(values),
+            },
+            index=index,
+        )
+
+    def count_hues(buffer):
+        """Rough count of clearly-green versus clearly-red line pixels."""
+        buffer.seek(0)
+        with Image.open(buffer) as image:
+            pixels = np.asarray(image.convert("RGB")).astype(int)
+        red, green = pixels[:, :, 0], pixels[:, :, 1]
+        return int(((green > 120) & (green > red + 60)).sum()), int(
+            ((red > 120) & (red > green + 60)).sum()
+        )
+
+    rising = price_frame([100 + index * 0.5 for index in range(60)])
+    falling = price_frame([200 - index * 0.5 for index in range(60)])
+
+    up_buffer = render_chart("AAPL", rising, "1d", "2m")
+    check(
+        "A chart renders to a real PNG",
+        up_buffer.getvalue()[:8] == b"\x89PNG\r\n\x1a\n",
+        f"{len(up_buffer.getvalue()) / 1024:.0f} KB",
+    )
+    check(
+        "The buffer comes back rewound to index 0",
+        up_buffer.tell() == 0,
+        f"position {up_buffer.tell()}",
+    )
+    check(
+        "The PNG is a sane size to attach to a message",
+        5_000 < len(up_buffer.getvalue()) < 2_000_000,
+    )
+
+    up_green, up_red = count_hues(up_buffer)
+    down_green, down_red = count_hues(render_chart("TSLA", falling, "1m", "1d"))
+    check("An up period draws a green line", up_green > up_red, f"green={up_green}, red={up_red}")
+    check("A down period draws a red line", down_red > down_green, f"green={down_green}, red={down_red}")
+
+    check(
+        "A perfectly flat series still renders",
+        render_chart("FLAT", price_frame([100.0] * 30), "1d", "2m").getvalue()[:4]
+        == b"\x89PNG",
+    )
+
+    for label, payload in (
+        ("empty history", pd.DataFrame()),
+        ("history with no Close column", pd.DataFrame({"Open": [1.0, 2.0]})),
+        ("a single data point", price_frame([100.0])),
+    ):
+        try:
+            render_chart("X", payload, "1d", "2m")
+            check(f"Refuses {label}", False, "it rendered anyway")
+        except ChartUnavailable:
+            check(f"Refuses {label}", True)
+        except Exception as error:  # noqa: BLE001
+            check(f"Refuses {label}", False, f"{type(error).__name__}: {error}")
+
+    # --- the interactive view
+    view = StockChartView("AAPL", discord.Embed(title="quote"), DEFAULT_TIMEFRAME)
+    buttons = [item for item in view.children if isinstance(item, discord.ui.Button)]
+    check("The view has four buttons", len(buttons) == 4, f"{len(buttons)}")
+    check(
+        "Buttons read 1D, 1W, 1M, 1Y",
+        [button.label for button in buttons] == ["1D", "1W", "1M", "1Y"],
+        ", ".join(str(button.label) for button in buttons),
+    )
+    check(
+        "Only the active timeframe is highlighted",
+        [button.style for button in buttons]
+        == [discord.ButtonStyle.primary] + [discord.ButtonStyle.secondary] * 3,
+        ", ".join(str(button.style) for button in buttons),
+    )
+    check("The view expires after 180 seconds", view.timeout == 180, str(view.timeout))
+
+    view.active = "1M"
+    view.sync_buttons()
+    moved = [item for item in view.children if isinstance(item, discord.ui.Button)]
+    check(
+        "The highlight follows the selected timeframe",
+        [button.style for button in moved]
+        == [
+            discord.ButtonStyle.secondary,
+            discord.ButtonStyle.secondary,
+            discord.ButtonStyle.primary,
+            discord.ButtonStyle.secondary,
+        ],
+    )
+
+    check(
+        "The chart embed points at the attachment",
+        view.chart_embed().image.url == f"attachment://{CHART_FILENAME}",
+        view.chart_embed().image.url,
+    )
+    check(
+        "The base embed is left imageless, so redraws start clean",
+        view.base_embed.image.url is None,
+    )
+
+    # --- the quote embed keeps everything it had, plus Open
+    quote = lookup_cog._quote_embed(
+        "AAPL",
+        {
+            "longName": "Apple Inc.",
+            "currency": "USD",
+            "currentPrice": 189.5,
+            "open": 188.0,
+            "previousClose": 187.2,
+            "dayHigh": 190.1,
+            "dayLow": 187.9,
+            "volume": 51_000_000,
+            "marketCap": 2_950_000_000_000,
+            "fullExchangeName": "NasdaqGS",
+        },
+    )
+    check(
+        "The quote embed keeps every original field and adds Open",
+        [field.name for field in quote.fields]
+        == [
+            "Price",
+            "Open",
+            "Daily change",
+            "Previous close",
+            "Day range",
+            "Volume",
+            "Market cap",
+        ],
+        ", ".join(field.name for field in quote.fields),
+    )
+    check(
+        "Every quote field fits Discord's cap",
+        all(len(field.value) <= 1024 and len(field.name) <= 256 for field in quote.fields),
+    )
+
     # ------------------------------------------------------------- test posts
     section("test-post labelling")
 
