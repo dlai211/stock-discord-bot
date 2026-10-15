@@ -61,6 +61,11 @@ never announced twice:
 - **The chart's timeframe buttons stay live for three minutes.** After that they
   grey out — run `/stock` again to get a fresh chart. Anyone who can see the
   message can press them.
+- **1D and 1W charts include pre-market and after-hours trading**, like
+  Robinhood's. 1M, 3M and 1Y show regular sessions only.
+- **The 1D percentage is measured from the previous close**, matching Robinhood.
+  The chart's last point is the latest trade *including* after-hours, so it can
+  differ by a cent or two from the Price field in the embed above.
 - **The weekly briefing only lists high-interest names and your own tracked
   tickers.** Roughly 150–250 companies report each week; listing them all would
   bury the ones that matter. Use `/track_earnings` to add anything it misses.

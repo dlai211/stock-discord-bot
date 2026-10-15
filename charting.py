@@ -12,6 +12,7 @@ import io
 import logging
 import threading
 import time
+from datetime import time as dtime
 from typing import NamedTuple
 
 import matplotlib
@@ -42,6 +43,16 @@ TEXT_COLOR = "#ffffff"
 # figure width without the labels colliding.
 TICK_COUNT = 5
 DEFAULT_TICK_FORMAT = "%b %d"
+# A day-tick timeframe never needs more than this before the labels collide.
+MAX_DAY_TICKS = 7
+
+# Bars stamped at or before this belong to the regular session. Used to find the
+# official close, as opposed to the 20:00 end of after-hours trading.
+REGULAR_CLOSE = dtime(16, 0)
+
+# Where the period's return is measured from.
+BASELINE_FIRST_BAR = "first_bar"
+BASELINE_PREVIOUS_CLOSE = "previous_close"
 
 # Each button click is a Yahoo request. Caching briefly stops someone flicking
 # through the timeframes from tripping the rate limit.
@@ -51,22 +62,39 @@ CACHE_MAX_ENTRIES = 64
 # pyplot keeps global figure state, so two renders on different threads can
 # tread on each other. Charts are small and infrequent; serialising is cheap.
 _render_lock = threading.Lock()
-_cache: dict[tuple[str, str, str], tuple[float, bytes]] = {}
+_cache: dict[tuple[str, str, str, bool], tuple[float, bytes]] = {}
 
 
 class Timeframe(NamedTuple):
-    """One timeframe button: what to fetch, and how to label its axis."""
+    """One timeframe button: what to fetch, and how to draw it."""
 
     label: str
     period: str
     interval: str
     tick_format: str
+    prepost: bool = False
+    day_ticks: bool = False
+    session_only: bool = False
+    baseline: str = BASELINE_FIRST_BAR
     fallback_interval: str | None = None
 
 
 TIMEFRAMES: tuple[Timeframe, ...] = (
-    Timeframe("1D", "1d", "2m", "%H:%M"),
-    Timeframe("1W", "5d", "15m", "%b %d"),
+    # Fetched over 5 days, not 1: the chart is trimmed to the latest session,
+    # and the wider window is what makes the previous close available to measure
+    # the return against. See BASELINE_PREVIOUS_CLOSE below.
+    Timeframe(
+        "1D",
+        "5d",
+        "2m",
+        "%H:%M",
+        prepost=True,
+        session_only=True,
+        baseline=BASELINE_PREVIOUS_CLOSE,
+    ),
+    # One tick per trading day, not five evenly spaced ones — the sessions are
+    # the natural divisions of a week.
+    Timeframe("1W", "5d", "5m", "%a", prepost=True, day_ticks=True),
     # Hourly bars, not daily. A month of daily closes is ~21 bare points, which
     # reads as a zigzag; a month of hourly bars is ~150 and reads as a curve.
     Timeframe("1M", "1mo", "1h", "%b %d"),
@@ -123,6 +151,51 @@ def tick_positions(count: int, wanted: int = TICK_COUNT) -> list[int]:
     return sorted({int(round(value)) for value in np.linspace(0, count - 1, wanted)})
 
 
+def day_start_positions(index) -> list[int]:
+    """Bar position where each calendar day begins."""
+    positions: list[int] = []
+    seen = None
+    for position, stamp in enumerate(index):
+        day = stamp.date()
+        if day != seen:
+            positions.append(position)
+            seen = day
+    return positions
+
+
+def trim_to_last_session(frame):
+    """Keep only the bars belonging to the most recent trading day.
+
+    1D is fetched over a wider window so the previous close is available; the
+    line itself should show a single session, which is what "1D" means.
+    """
+    if frame is None or frame.empty:
+        return frame
+    last_day = frame.index[-1].date()
+    return frame[[stamp.date() == last_day for stamp in frame.index]]
+
+
+def previous_session_close(frame) -> float | None:
+    """The last regular-hours close before the most recent session.
+
+    Robinhood measures the 1D change against this, not against the first bar of
+    the extended session. The two differ because with extended hours enabled the
+    first bar is the 04:00 pre-market, so measuring from it understates the move
+    by a small amount every day.
+    """
+    if frame is None or frame.empty:
+        return None
+    last_day = frame.index[-1].date()
+    earlier = [
+        position
+        for position, stamp in enumerate(frame.index)
+        if stamp.date() < last_day and stamp.time() <= REGULAR_CLOSE
+    ]
+    if not earlier:
+        return None
+    return float(frame["Close"].iloc[earlier[-1]])
+
+
 def generate_stock_chart(
     symbol: str, period: str, interval: str, label: str | None = None
 ) -> io.BytesIO:
@@ -131,18 +204,31 @@ def generate_stock_chart(
     Returns a BytesIO positioned at index 0. Raises ChartUnavailable when there
     is nothing worth plotting. Blocking — call it via `utils.run_blocking()`.
 
-    `label` names the button this chart belongs to and decides the title and the
-    tick format; without it they are inferred from period/interval.
+    `label` names the button this chart belongs to and decides the title, the
+    tick format, whether extended hours are included, and where the return is
+    measured from. Without it those are inferred from period/interval.
     """
     entry = timeframe(label) if label else timeframe_for(period, interval)
-    key = (symbol.upper(), period, interval)
+    prepost = entry.prepost if entry else False
+    key = (symbol.upper(), period, interval, prepost)
+
     cached = _cache.get(key)
     if cached is not None and time.monotonic() - cached[0] < CACHE_TTL_SECONDS:
         return io.BytesIO(cached[1])
 
-    history = yf.Ticker(symbol).history(period=period, interval=interval)
+    history = _fetch(symbol, period, interval, prepost)
+
+    # Measured before trimming, because the previous close lives on the day the
+    # trim removes.
+    baseline = None
+    if entry is not None and entry.baseline == BASELINE_PREVIOUS_CLOSE:
+        baseline = previous_session_close(history)
+
+    if entry is not None and entry.session_only:
+        history = trim_to_last_session(history)
+
     try:
-        buffer = render_chart(symbol, history, period, interval, entry)
+        buffer = render_chart(symbol, history, period, interval, entry, baseline)
     except ChartUnavailable:
         fallback = entry.fallback_interval if entry else None
         if fallback is None:
@@ -156,8 +242,8 @@ def generate_stock_chart(
             period,
             fallback,
         )
-        history = yf.Ticker(symbol).history(period=period, interval=fallback)
-        buffer = render_chart(symbol, history, period, fallback, entry)
+        history = _fetch(symbol, period, fallback, prepost)
+        buffer = render_chart(symbol, history, period, fallback, entry, None)
 
     png = buffer.getvalue()
 
@@ -170,17 +256,25 @@ def generate_stock_chart(
     return io.BytesIO(png)
 
 
+def _fetch(symbol: str, period: str, interval: str, prepost: bool):
+    return yf.Ticker(symbol).history(
+        period=period, interval=interval, prepost=prepost
+    )
+
+
 def render_chart(
     symbol: str,
     history,
     period: str,
     interval: str,
     entry: Timeframe | None = None,
+    baseline_price: float | None = None,
 ) -> io.BytesIO:
     """Draw a chart from an already-fetched price history.
 
     Split out from the fetch so it can be exercised offline, with a synthetic
-    frame, by `verify.py`.
+    frame, by `verify.py`. `baseline_price` overrides the default of measuring
+    from the period's opening bar.
     """
     if history is None or getattr(history, "empty", True):
         raise ChartUnavailable(f"No {period}/{interval} price history for {symbol}")
@@ -191,14 +285,17 @@ def render_chart(
     if len(closes) < 2:
         raise ChartUnavailable(f"Not enough {period} data points for {symbol}")
 
-    # The brief colours the line green when the latest close is at or above the
-    # period's opening price, so the first open is the reference point.
-    opens = history["Open"].dropna() if "Open" in history else closes.iloc[:0]
-    opening = float(opens.iloc[0]) if len(opens) else float(closes.iloc[0])
+    if baseline_price is not None:
+        start = float(baseline_price)
+    else:
+        # Otherwise the period's own opening price is the reference point.
+        opens = history["Open"].dropna() if "Open" in history else closes.iloc[:0]
+        start = float(opens.iloc[0]) if len(opens) else float(closes.iloc[0])
+
     latest = float(closes.iloc[-1])
-    change = latest - opening
-    percent = (change / opening * 100) if opening else 0.0
-    color = UP_COLOR if latest >= opening else DOWN_COLOR
+    change = latest - start
+    percent = (change / start * 100) if start else 0.0
+    color = UP_COLOR if latest >= start else DOWN_COLOR
 
     values = closes.to_numpy(dtype=float)
 
@@ -234,6 +331,12 @@ def render_chart(
         axes.set_ylim(floor, ceiling)
 
         ticks = tick_positions(len(values))
+        if entry is not None and entry.day_ticks:
+            day_starts = day_start_positions(closes.index)
+            # A 5d window holds five sessions; past seven the labels would
+            # collide, so fall back to even spacing if it is ever wider.
+            if 2 <= len(day_starts) <= MAX_DAY_TICKS:
+                ticks = day_starts
         axes.set_xticks(ticks)
         axes.set_xticklabels(
             [closes.index[int(position)].strftime(tick_format) for position in ticks]

@@ -471,13 +471,58 @@ other a price quote, and neither depends on the watch list or on each other.
 
 `/stock` attaches a price chart and five timeframe buttons.
 
-| Button | yfinance period | interval | Bars for AAPL | Tick labels |
+| Button | yfinance period | interval | Extended hours | Tick labels |
 |---|---|---|---|---|
-| `1D` | `1d` | `2m` | ~195 | `%H:%M` |
-| `1W` | `5d` | `15m` | ~130 | `%b %d` |
-| `1M` | `1mo` | `1h` | ~154 | `%b %d` |
-| `3M` | `3mo` | `1h` (falls back to `1d`) | ~455 | `%b %d` |
-| `1Y` | `1y` | `1d` | ~251 | `%b '%y` |
+| `1D` | `5d`, trimmed to one session | `2m` | **yes** | `%H:%M` |
+| `1W` | `5d` | `5m` | **yes** | `%a`, one per day |
+| `1M` | `1mo` | `1h` | no | `%b %d` |
+| `3M` | `3mo` | `1h` (falls back to `1d`) | no | `%b %d` |
+| `1Y` | `1y` | `1d` | no | `%b '%y` |
+
+The brief asked for `interval="10m"` on 1W. **`10m` is not a valid Yahoo
+interval** — it raises `Invalid input` at fetch time. `5m` is used instead, as
+the closer match to the intended density of the two options that exist (5m gives
+~630 bars; 15m gives ~210).
+
+#### Extended hours
+
+**1D and 1W include pre-market and after-hours trading** (`prepost=True`); the
+longer timeframes do not. Verified live: a 5-day extended pull returns **597
+pre-market and 115 after-hours bars** against 975 regular-hours bars in the same
+window.
+
+**1D is fetched over `5d`, then trimmed to the latest session.** `period="1d"`
+with extended hours starts at 04:00, so during the pre-market it returns only a
+few minutes of data, and just after 20:00 it would span two partial sessions.
+Fetching five days and keeping the bars dated the same as the last one yields
+exactly one session — and leaves the previous close available, which is what the
+return is measured from.
+
+Early in the pre-market the 1D chart is genuinely short: at 04:10 ET it covers
+ten minutes. That is not a bug — there is nothing else to draw yet, and
+Robinhood shows the same window.
+
+**1W ticks are anchored to each session**, not evenly spaced, so a week reads as
+Fri / Mon / Tue / Wed / Thu. If a window ever held more than seven sessions the
+labels would collide, so it falls back to even spacing.
+
+#### Where the return starts from
+
+| Timeframe | Baseline | Why |
+|---|---|---|
+| `1D` | **previous regular-session close** | Robinhood's daily change is measured from it |
+| `1W`–`1Y` | first bar of the range | also what Robinhood does |
+
+The distinction matters. With extended hours on, the first bar of the day is the
+**04:00 pre-market**, not yesterday's close. Measuring from it understated AAPL's
+move by 0.10pp when this was written — `+1.29%` instead of `+1.39%`. Small, but
+precisely the kind of gap a side-by-side comparison against Robinhood catches.
+
+`previous_session_close()` takes the last bar at or before **16:00 ET** on an
+earlier day, so the 20:00 end of after-hours is never mistaken for the official
+close. It is derived from the frame already fetched, so it costs no extra
+request, and returns `None` rather than inventing a number when there is no
+earlier session.
 
 #### Continuous trading-period axis
 
@@ -1433,3 +1478,69 @@ fault.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 163/163 (168/168 with `--live`) |
+
+### 2026-10-15 01:12 PT — Extended hours and Robinhood's return basis
+
+**Added — extended hours on 1D and 1W** (`prepost=True`). Pre-market and
+after-hours bars are now on the chart; 1M/3M/1Y stay regular-session only.
+
+**Added — 1W day ticks.** One tick per trading session, anchored to the first bar
+of each day, labelled `%a` — so a week reads Fri / Mon / Tue / Wed / Thu instead
+of five evenly spaced dates that land mid-session.
+
+**Changed — 1D measures its return from the previous close**, not from the first
+bar of the period as the brief specified. With extended hours on, the first bar
+is the 04:00 pre-market, so the two differ — see below.
+
+**Changed — 1D is fetched over `5d` and trimmed to the latest session.**
+`period="1d"` plus extended hours returns only a few minutes of data during the
+pre-market, and would span two partial sessions just after 20:00.
+
+**Two corrections to the brief**
+1. **`interval="10m"` does not exist.** Yahoo accepts `1m, 2m, 5m, 15m, 30m,
+   60m, 90m, 1h, 4h, 1d, 5d, 1wk, 1mo, 3mo` — anything else raises
+   `Invalid input` at fetch time. 1W uses `5m`. A test now pins every configured
+   interval against that list, so the trap cannot be walked into again.
+2. **The return baseline as specified would not have matched Robinhood.** The
+   brief said to measure from the first bar of the period; with extended hours
+   that bar is the 04:00 pre-market, not the previous close. Measured on AAPL:
+   `+1.29%` from the first bar versus `+1.39%` from the previous close — a 0.10pp
+   gap, every day. Confirmed with the user and switched to the previous close for
+   1D; 1W–1Y keep the first-bar basis, which is also what Robinhood uses.
+
+**Verified**
+- `python verify.py` — **175/175 checks passed**, exit 0.
+- `python verify.py --live` — **183/183**: all five timeframes fetch and render,
+  and the extended-hours premise is checked against real data rather than
+  assumed — **597 pre-market and 115 after-hours bars**, with regular hours
+  confirmed as a strict subset (975 vs 1492 bars).
+- `previous_session_close()` asserted to pick the **15:58 regular bar at
+  341.27**, not the 19:58 after-hours bar at 341.90, and to return `None` when
+  there is no earlier session rather than inventing a number.
+- The baseline is asserted to actually *drive* the render, not merely be
+  accepted: the same frame drawn against a baseline of 100 comes out
+  green-dominant and against 400 comes out red-dominant.
+- `trim_to_last_session()` asserted to keep only the latest day's bars.
+- `day_start_positions()` asserted to land on the first bar of each session.
+- Every configured interval asserted against Yahoo's accepted list.
+- Rendered 1D and 1W from live data and inspected them. 1W shows the five day
+  ticks and continuous extended-hours trading; 1D at 04:10 ET shows ten minutes
+  of pre-market with the return measured from the previous close.
+
+**Note worth keeping.** At 04:10 ET the 1D chart is ten minutes long. That is
+not a defect — the session has only just started, there is nothing else to draw,
+and Robinhood shows the same window. It resolves itself by mid-morning.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Chart timeframes resolved live | 5/5 |
+| Extended-hours bars confirmed live | 597 pre-market + 115 after-hours |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 175/175 (183/183 with `--live`) |

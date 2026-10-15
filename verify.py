@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 
 import discord
 import pandas as pd
@@ -855,16 +855,20 @@ async def main(live: bool = False) -> int:
     from PIL import Image
 
     from charting import (
+        BASELINE_PREVIOUS_CLOSE,
         CHART_FILENAME,
         DEFAULT_TIMEFRAME,
         TIMEFRAMES,
         ChartUnavailable,
+        day_start_positions,
         generate_stock_chart,
         label_for,
+        previous_session_close,
         render_chart,
         tick_positions,
         timeframe,
         timeframe_args,
+        trim_to_last_session,
     )
     from cogs.market_commands import StockChartView
 
@@ -877,13 +881,51 @@ async def main(live: bool = False) -> int:
         "Timeframes match the spec",
         [(entry.label, entry.period, entry.interval) for entry in TIMEFRAMES]
         == [
-            ("1D", "1d", "2m"),
-            ("1W", "5d", "15m"),
+            ("1D", "5d", "2m"),
+            ("1W", "5d", "5m"),
             ("1M", "1mo", "1h"),
             ("3M", "3mo", "1h"),
             ("1Y", "1y", "1d"),
         ],
         ", ".join(f"{entry.label}={entry.period}/{entry.interval}" for entry in TIMEFRAMES),
+    )
+    # Yahoo rejects anything outside this list. It matters: the brief asked for
+    # interval="10m" for 1W, which raises "Invalid input" at fetch time.
+    yahoo_intervals = {
+        "1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "4h",
+        "1d", "5d", "1wk", "1mo", "3mo",
+    }
+    check(
+        "Every interval is one Yahoo accepts",
+        all(entry.interval in yahoo_intervals for entry in TIMEFRAMES),
+        ", ".join(sorted({entry.interval for entry in TIMEFRAMES})),
+    )
+    check(
+        "Extended hours are on for the short timeframes only",
+        [entry.label for entry in TIMEFRAMES if entry.prepost] == ["1D", "1W"],
+        ", ".join(entry.label for entry in TIMEFRAMES if entry.prepost),
+    )
+    check(
+        "1D measures its return from the previous close",
+        [
+            entry.label
+            for entry in TIMEFRAMES
+            if entry.baseline == BASELINE_PREVIOUS_CLOSE
+        ]
+        == ["1D"],
+        ", ".join(f"{entry.label}:{entry.baseline}" for entry in TIMEFRAMES),
+    )
+    check(
+        "Only 1D trims to a single session",
+        [entry.label for entry in TIMEFRAMES if entry.session_only] == ["1D"],
+    )
+    check(
+        "Only 1W uses per-day ticks",
+        [entry.label for entry in TIMEFRAMES if entry.day_ticks] == ["1W"],
+        ", ".join(
+            entry.label for entry in TIMEFRAMES if entry.day_ticks
+        )
+        or "none",
     )
     check(
         "Buttons are ordered 1D, 1W, 1M, 3M, 1Y",
@@ -910,7 +952,7 @@ async def main(live: bool = False) -> int:
         ", ".join(f"{entry.label}:{entry.tick_format}" for entry in TIMEFRAMES),
     )
     check("The default timeframe is 1D", DEFAULT_TIMEFRAME == "1D")
-    check("A label maps back to its period/interval", timeframe_args("1W") == ("5d", "15m"))
+    check("A label maps back to its period/interval", timeframe_args("1W") == ("5d", "5m"))
     check("A period/interval maps back to its label", label_for("1y", "1d") == "1Y")
     check("The attachment name is the one the embed points at", CHART_FILENAME == "chart.png")
 
@@ -1050,6 +1092,82 @@ async def main(live: bool = False) -> int:
             check(f"Refuses {label}", True)
         except Exception as error:  # noqa: BLE001
             check(f"Refuses {label}", False, f"{type(error).__name__}: {error}")
+
+    # --- extended hours, the session trim, and the previous-close baseline
+    def session_frame():
+        """Wednesday's extended session, then Thursday's pre-market."""
+        stamps = pd.to_datetime(
+            [
+                "2026-10-14 04:00",
+                "2026-10-14 09:30",
+                "2026-10-14 15:58",
+                "2026-10-14 19:58",
+                "2026-10-15 04:00",
+                "2026-10-15 04:02",
+            ]
+        )
+        close = [340.0, 341.0, 341.27, 341.9, 341.5, 341.58]
+        return pd.DataFrame(
+            {
+                "Open": close,
+                "High": close,
+                "Low": close,
+                "Close": close,
+                "Volume": [1.0] * len(close),
+            },
+            index=stamps,
+        )
+
+    frame = session_frame()
+    check(
+        "The previous close is the last regular-hours close",
+        previous_session_close(frame) == 341.27,
+        f"{previous_session_close(frame)} — not the 341.90 after-hours bar",
+    )
+    trimmed = trim_to_last_session(frame)
+    check(
+        "Trimming keeps only the most recent session",
+        len(trimmed) == 2 and list(trimmed.index) == list(frame.index[4:]),
+        f"{len(trimmed)} of {len(frame)} bars",
+    )
+    check(
+        "A series with no earlier session has no previous close",
+        previous_session_close(trimmed) is None,
+        "returns None rather than inventing one",
+    )
+
+    session_index = pd.to_datetime(
+        [
+            "2026-10-12 09:30",
+            "2026-10-12 10:00",
+            "2026-10-13 09:30",
+            "2026-10-13 16:00",
+            "2026-10-14 09:30",
+        ]
+    )
+    check(
+        "Day ticks land on the first bar of each session",
+        day_start_positions(session_index) == [0, 2, 4],
+        str(day_start_positions(session_index)),
+    )
+    check(
+        "A single-day series gets one day tick",
+        day_start_positions(session_index[:2]) == [0],
+    )
+
+    # The baseline must actually drive the comparison, not merely be accepted.
+    below = count_hues(render_chart("B", frame, "5d", "2m", None, 100.0))
+    above = count_hues(render_chart("B", frame, "5d", "2m", None, 400.0))
+    check(
+        "A baseline below the last price draws green",
+        below[0] > below[1],
+        f"green={below[0]}, red={below[1]}",
+    )
+    check(
+        "A baseline above the last price draws red",
+        above[1] > above[0],
+        f"green={above[0]}, red={above[1]}",
+    )
 
     # --- the interactive view
     view = StockChartView("AAPL", discord.Embed(title="quote"), DEFAULT_TIMEFRAME)
@@ -1368,6 +1486,38 @@ async def main(live: bool = False) -> int:
                 )
             except Exception as error:  # noqa: BLE001 - reporting the failure is the point
                 check(label, False, f"{type(error).__name__}: {error}")
+
+        # The 1D chart is only right if Yahoo actually serves extended hours —
+        # the offline suite can only prove we asked for them.
+        import yfinance as yf
+
+        extended = await asyncio.to_thread(
+            lambda: yf.Ticker("AAPL").history(
+                period="5d", interval="2m", prepost=True
+            )
+        )
+        before = sum(1 for stamp in extended.index if stamp.time() < dtime(9, 30))
+        after = sum(1 for stamp in extended.index if stamp.time() >= dtime(16, 0))
+        check(
+            "Yahoo returns extended-hours bars",
+            before > 0 and after > 0,
+            f"{before} pre-market, {after} after-hours bars",
+        )
+        check(
+            "A previous close is available to measure 1D against",
+            previous_session_close(extended) is not None,
+            str(previous_session_close(extended)),
+        )
+        regular = await asyncio.to_thread(
+            lambda: yf.Ticker("AAPL").history(
+                period="5d", interval="2m", prepost=False
+            )
+        )
+        check(
+            "Regular hours are a strict subset of extended",
+            len(regular) < len(extended),
+            f"{len(regular)} regular vs {len(extended)} extended bars",
+        )
 
     # ----------------------------------------------------------------- summary
     section("summary")
