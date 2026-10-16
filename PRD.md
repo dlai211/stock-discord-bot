@@ -280,9 +280,60 @@ directly. FRED is the free alternative, at the cost of the mapped times above.
 - **State is written only after a successful post**, so a failed send is retried
   on the next poll instead of being silently lost.
 
-Release windows are tracked as labels and recorded in the alert footer. They are
-defined in Eastern and displayed in Pacific — `05:25-06:30 PT window
-(CPI / PCE / GDP)` and `10:55-11:45 PT window (FOMC)`. See §5.7.
+#### The alert leads with rates, not levels
+
+An alert reading "CPI 336.30" tells a reader nothing — the market trades the rate
+of change. Every field is a rate now, with the index level demoted to context:
+
+| Series | Primary | Context |
+|---|---|---|
+| CPI | MoM rate, YoY rate | Index level (1982-84=100) |
+| Core PCE | MoM rate, YoY rate | Index level (2017=100) |
+| Real GDP | Annualized QoQ (SAAR), YoY growth | Real output, $B |
+
+Each headline carries the previous period's rate beside it, so acceleration and
+deceleration are visible without a second lookup:
+
+```
+MoM Rate
+   +0.65%
+   vs +0.40% prior month
+```
+
+GDP uses BEA's standard annualisation, `((new / prev) ** 4 - 1) * 100`, reported
+to one decimal — `+2.2%`, not four more digits nobody quotes.
+
+Colours follow the series: gold for CPI, purple for Core PCE, blue for GDP. A
+test post overrides all three with grey.
+
+#### Where the numbers come from
+
+`rate_metrics()` is a pure function over the observations, so the arithmetic is
+unit-tested against **real CPI and GDP observations** rather than synthetic ones
+— the expected rates were computed by hand from those same values and
+cross-checked against a live pull.
+
+It returns `None` rather than a partial figure when there is not enough history
+to state every rate: a rate needs the latest pair *and* both of their year-ago
+counterparts, so 14 monthly or 6 quarterly observations. A half-derivable number
+is worse than none on an alert someone trades off.
+
+#### Footer
+
+`Source: {agency} via FRED • Released {date}` — BLS for CPI, BEA for PCE and GDP.
+
+The release date comes from FRED's own `last_updated` metadata. It is **not** the
+observation period: September 2026 CPI was released on Oct 14, and the alert says
+so. The same metadata supplies the units string (`Index 1982-1984=100`,
+`Billions of Chained 2017 Dollars`), so base periods are read from FRED rather
+than hardcoded; each series carries a fallback in case that lookup fails.
+
+Metadata is fetched **only when an alert is actually posting**, so the 15-minute
+poll does not pay for a lookup it will not use.
+
+Release windows are still computed and **logged** (05:25-06:30 PT for CPI/PCE/GDP,
+10:55-11:45 PT for FOMC — see §5.7) but no longer appear in the embed. The actual
+release date is strictly more informative than which window it landed in.
 
 ### 5.5 Test commands
 
@@ -1544,3 +1595,79 @@ and Robinhood shows the same window. It resolves itself by mid-morning.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 175/175 (183/183 with `--live`) |
+
+### 2026-10-16 10:20 PT — Macro alerts now lead with rates of change
+
+**Changed — the alerts report rates, not index levels.** A CPI alert reading
+"336.30" told a reader nothing; the market trades the rate of change. Every field
+is now a rate, and the index level is demoted to context. See §5.4.
+
+| Series | Before | After |
+|---|---|---|
+| CPI | 336.30, previous 334.13 | **+0.65% MoM** (vs +0.40%), **+4.02% YoY** (vs +3.71%) |
+| Core PCE | 130.46, previous 130.13 | **+0.25% MoM** (vs +0.13%), **+3.01% YoY** (vs +2.98%) |
+| Real GDP | $24,408.01B | **+2.2% SAAR** (vs +2.5%), **+2.19% YoY** |
+
+Each headline carries the prior period's rate beside it, so acceleration and
+deceleration are readable without a second lookup.
+
+**Added — series-specific titles and colours**: `📊 US Consumer Price Index (CPI)`
+in gold, `📊 US Core PCE Price Index (Fed's Preferred Gauge)` in purple, and
+`📈 US Real Gross Domestic Product (GDP)` in blue. Test posts override all three
+with grey, and the `[TEST]` tag goes in the title without touching the fields.
+
+**Added — `rate_metrics()`**, a pure function so the arithmetic is unit-testable
+offline. It returns `None` rather than a partial figure when there is not enough
+history — 14 monthly or 6 quarterly observations.
+
+**Changed — the footer is now `Source: {agency} via FRED • Released {date}`**,
+with BLS for CPI and BEA for PCE and GDP.
+
+**Verified**
+- `python verify.py` — **212/212 checks passed**, exit 0.
+- `python verify.py --live` — **220/220**.
+- The rates are asserted against **real observations**, not synthetic ones: CPI
+  from the actual last 15 `CPIAUCSL` prints must give exactly +0.65% MoM, +0.40%
+  prior month, +4.02% YoY, +3.71% prior year; GDP from the real `GDPC1` quarters
+  must annualise to +2.2% with a +2.5% prior quarter. Those expected values were
+  worked out by hand from the same numbers and cross-checked against a live pull.
+- Field names, titles, colours and footer attribution asserted per series, plus
+  that a test post's fields are **byte-identical** to a real one.
+- Rendered all three embeds from live FRED and read them. The release dates came
+  back as **Oct 14 for CPI and Sep 30 for PCE and GDP** — and the Oct 14 CPI date
+  independently corroborates the macro calendar built three sessions ago, which
+  had predicted `Wednesday, Oct 14 · CPI Inflation · 05:30 PT`.
+
+**A real bug the offline suite could not have caught**
+- `fredapi.get_series_info()` returns a **pandas Series, not a dict**. The embed
+  did `(info or {}).get("units")`, and a Series has no truth value, so this
+  raised `ValueError: The truth value of a Series is ambiguous` — but only on a
+  live FRED call. Every offline test passed a dict, so every offline test passed.
+  Caught the first time the preview ran against real FRED.
+- Fixed with `as_mapping()`, which normalises whatever comes back, and there is
+  now a regression test that feeds a real `pd.Series` through both
+  `release_date()` and the embed builder.
+
+**Note on `Released` vs the period.** The footer date is when FRED published the
+series, from `last_updated` — *not* the observation period. September 2026 CPI
+was released on Oct 14; labelling the observation date as "Released" would have
+put "Sep 1" on a number that came out six weeks later.
+
+**Note on the release window.** It no longer appears in the embed; the footer now
+carries the agency and the actual release date, which is strictly more
+informative than which window it landed in. The window is still computed and
+written to the log when an alert posts.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Macro alerts rendered from live FRED | 3/3, rates matching hand-checked values |
+| Chart timeframes resolved live | 5/5 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 212/212 (220/220 with `--live`) |

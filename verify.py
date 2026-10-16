@@ -203,6 +203,9 @@ async def main(live: bool = False) -> int:
         MONITORED_SERIES,
         RELEASE_WINDOWS,
         MacroAlerts,
+        as_mapping,
+        rate_metrics,
+        release_date,
         release_window_label,
     )
     from cogs.market_commands import MarketCommands
@@ -286,20 +289,235 @@ async def main(live: bool = False) -> int:
     except Exception as error:  # noqa: BLE001 - reporting the failure is the point
         check("Briefing embed builds", False, f"{type(error).__name__}: {error}")
 
-    try:
-        alert = MacroAlerts._alert_embed(
-            "CPIAUCSL",
-            {
-                "date": date(2026, 9, 1),
-                "value": 325.4,
-                "previous": 324.1,
-                "year_ago": 315.2,
-            },
-            "08:30 ET window (CPI / PCE / GDP)",
+    # ------------------------------------------------------- macro alert rates
+    section("macro alert rates of change")
+
+    # Real CPIAUCSL observations. The expected rates below were computed by hand
+    # from these same numbers and cross-checked against a live FRED pull.
+    cpi_levels = [
+        321.44, 322.17, 323.29, 324.25, 325.06, 326.03, 326.59, 327.46,
+        330.29, 332.41, 333.98, 332.57, 332.81, 334.13, 336.30,
+    ]
+    cpi_series = pd.Series(
+        cpi_levels, index=pd.date_range("2025-07-01", periods=len(cpi_levels), freq="MS")
+    )
+    cpi_metrics = rate_metrics(cpi_series, 12)
+
+    check("CPI metrics compute", cpi_metrics is not None)
+    if cpi_metrics:
+        check(
+            "CPI MoM rate",
+            round(cpi_metrics["mom"], 2) == 0.65,
+            f"{cpi_metrics['mom']:+.2f}%",
         )
-        check("Macro alert embed builds", True, f"{len(alert.fields)} field(s)")
-    except Exception as error:  # noqa: BLE001
-        check("Macro alert embed builds", False, f"{type(error).__name__}: {error}")
+        check(
+            "CPI prior-month rate",
+            round(cpi_metrics["prior_mom"], 2) == 0.40,
+            f"{cpi_metrics['prior_mom']:+.2f}%",
+        )
+        check(
+            "CPI YoY rate",
+            round(cpi_metrics["yoy"], 2) == 4.02,
+            f"{cpi_metrics['yoy']:+.2f}%",
+        )
+        check(
+            "CPI prior-year rate",
+            round(cpi_metrics["prior_yoy"], 2) == 3.71,
+            f"{cpi_metrics['prior_yoy']:+.2f}%",
+        )
+        check(
+            "A monthly series reports no annualised rate",
+            cpi_metrics["annualized"] is None,
+            "annualisation is a quarterly thing only",
+        )
+
+    # Real GDPC1 observations, same approach.
+    # Six observations, not five: a rate needs the latest pair *and* both of
+    # their year-ago counterparts.
+    gdp_levels = [23650.21, 23884.56, 24112.97, 24125.48, 24274.38, 24408.01]
+    gdp_series = pd.Series(
+        gdp_levels,
+        index=pd.date_range("2025-01-01", periods=len(gdp_levels), freq="QS"),
+    )
+    gdp_metrics = rate_metrics(gdp_series, 4)
+    check("GDP metrics compute", gdp_metrics is not None)
+    if gdp_metrics:
+        check(
+            "GDP annualised QoQ (SAAR)",
+            round(gdp_metrics["annualized"], 1) == 2.2,
+            f"{gdp_metrics['annualized']:+.1f}% — BEA's ((new/prev)**4 - 1)",
+        )
+        check(
+            "GDP prior-quarter annualised rate",
+            round(gdp_metrics["prior_annualized"], 1) == 2.5,
+            f"{gdp_metrics['prior_annualized']:+.1f}%",
+        )
+        check(
+            "GDP YoY growth",
+            round(gdp_metrics["yoy"], 2) == 2.19,
+            f"{gdp_metrics['yoy']:+.2f}%",
+        )
+
+    check(
+        "Too little history states no rate at all",
+        rate_metrics(cpi_series.tail(12), 12) is None,
+        "a half-derivable number is worse than none",
+    )
+    check(
+        "A zero or negative level states no rate",
+        rate_metrics(
+            pd.Series([0.0] * len(cpi_series), index=cpi_series.index), 12
+        )
+        is None,
+        "ratios against zero are meaningless",
+    )
+
+    # --- the embed leads with those rates
+    alert_metrics = cpi_metrics
+    gdp_alert_metrics = gdp_metrics
+
+    alert = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics)
+    check(
+        "CPI fields lead with the rates, not the index level",
+        [field.name for field in alert.fields]
+        == ["MoM Rate", "YoY Rate", "Index Level"],
+        ", ".join(field.name for field in alert.fields),
+    )
+    check(
+        "CPI title matches the spec",
+        alert.title == "\U0001f4ca US Consumer Price Index (CPI) — September 2026",
+        alert.title,
+    )
+    check(
+        "CPI index level is secondary context, with its base",
+        "336.30" in alert.fields[2].value and "1982" in alert.fields[2].value,
+        alert.fields[2].value.replace("\n", " / "),
+    )
+    check(
+        "CPI MoM field compares against the prior month",
+        "+0.65%" in alert.fields[0].value and "+0.40%" in alert.fields[0].value,
+        alert.fields[0].value.replace("\n", " / "),
+    )
+    check(
+        "CPI colour is gold",
+        alert.color.value == 0xF1C40F,
+        hex(alert.color.value),
+    )
+    check(
+        "CPI footer credits the BLS",
+        (alert.footer.text or "").startswith("Source: BLS via FRED"),
+        alert.footer.text,
+    )
+
+    gdp_alert = MacroAlerts._alert_embed(
+        "GDPC1", gdp_alert_metrics, {"units": "Billions of Chained 2017 Dollars"}
+    )
+    check(
+        "GDP fields lead with annualised growth and YoY",
+        [field.name for field in gdp_alert.fields]
+        == ["Annualized QoQ (SAAR)", "YoY Growth", "Real Output"],
+        ", ".join(field.name for field in gdp_alert.fields),
+    )
+    check(
+        "GDP title matches the spec",
+        gdp_alert.title == "\U0001f4c8 US Real Gross Domestic Product (GDP) — Q2 2026",
+        gdp_alert.title,
+    )
+    check(
+        "GDP reports the annualised rate to one decimal",
+        "+2.2%" in gdp_alert.fields[0].value and "Annualized" not in gdp_alert.title,
+        gdp_alert.fields[0].value.replace("\n", " / "),
+    )
+    check(
+        "GDP real output is shown in billions",
+        "$24,408.0B" in gdp_alert.fields[2].value,
+        gdp_alert.fields[2].value.replace("\n", " / "),
+    )
+    check(
+        "GDP colour is blue",
+        gdp_alert.color.value == 0x3498DB,
+        hex(gdp_alert.color.value),
+    )
+
+    pce_alert = MacroAlerts._alert_embed(
+        "PCEPILFE", cpi_metrics, {"units": "Index 2017=100"}
+    )
+    check(
+        "Core PCE title matches the spec",
+        pce_alert.title
+        == "\U0001f4ca US Core PCE Price Index (Fed's Preferred Gauge) — September 2026",
+        pce_alert.title,
+    )
+    check(
+        "Core PCE colour is purple",
+        pce_alert.color.value == 0x9B59B6,
+        hex(pce_alert.color.value),
+    )
+    check(
+        "Core PCE footer credits the BEA",
+        (pce_alert.footer.text or "").startswith("Source: BEA via FRED"),
+        pce_alert.footer.text,
+    )
+
+    # --- release date and units come from FRED's own metadata
+    check(
+        "The release date is read from FRED's last_updated",
+        release_date({"last_updated": "2026-10-14 08:08:29-05"}) == date(2026, 10, 14),
+        str(release_date({"last_updated": "2026-10-14 08:08:29-05"})),
+    )
+    check("A missing release date is tolerated", release_date(None) is None)
+    check("A malformed release date is tolerated", release_date({"last_updated": "?"}) is None)
+
+    # fredapi returns series metadata as a pandas Series, and a Series has no
+    # truth value — `info or {}` raises "truth value is ambiguous" on it. Every
+    # offline test above passed a dict, so only a live run surfaced this.
+    series_info = pd.Series(
+        {"units": "Index 2017=100", "last_updated": "2026-09-30 07:43:28-05"}
+    )
+    check(
+        "Series metadata normalises to a dict",
+        as_mapping(series_info)["units"] == "Index 2017=100",
+        "the form fredapi actually returns",
+    )
+    check("None metadata normalises to an empty dict", as_mapping(None) == {})
+    check(
+        "A release date survives coming from a Series",
+        release_date(series_info) == date(2026, 9, 30),
+        str(release_date(series_info)),
+    )
+    from_series = MacroAlerts._alert_embed("PCEPILFE", alert_metrics, series_info)
+    check(
+        "An alert renders from Series metadata",
+        "Index 2017=100" in from_series.fields[2].value,
+        from_series.fields[2].value.replace("\n", " / "),
+    )
+
+    dated = MacroAlerts._alert_embed(
+        "CPIAUCSL", alert_metrics, {"last_updated": "2026-10-14 08:08:29-05"}
+    )
+    check(
+        "The footer carries the release date",
+        "Released Oct 14, 2026" in (dated.footer.text or ""),
+        dated.footer.text,
+    )
+    fallback_units = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics)
+    check(
+        "Without metadata the configured base period is used",
+        "1982" in fallback_units.fields[2].value,
+        fallback_units.fields[2].value.replace("\n", " / "),
+    )
+    check(
+        "Every macro alert field fits Discord's cap",
+        all(
+            len(field.value) <= 1024 and len(field.name) <= 256
+            for embed in (alert, gdp_alert, pce_alert, dated)
+            for field in embed.fields
+        ),
+    )
+    check(
+        "Every macro alert title fits Discord's cap",
+        all(len(embed.title or "") <= 256 for embed in (alert, gdp_alert, pce_alert)),
+    )
 
     for periods, expected in ((4, "Q2 2026"), (12, "June 2026")):
         label = MacroAlerts._period_label(date(2026, 6, 30), periods)
@@ -1256,23 +1474,28 @@ async def main(live: bool = False) -> int:
         "TEST POST" in (test_briefing.footer.text or ""),
     )
 
-    alert_observation = {
-        "date": date(2026, 9, 1),
-        "value": 325.4,
-        "previous": 324.1,
-        "year_ago": 315.2,
-    }
-    test_alert = MacroAlerts._alert_embed("CPIAUCSL", alert_observation, None, is_test=True)
-    check("Alert test post is labelled", "[TEST]" in test_alert.title)
+    test_alert = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics, is_test=True)
+    real_alert = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics)
+    check(
+        "Alert test post is labelled",
+        test_alert.title.startswith("[TEST] "),
+        test_alert.title,
+    )
     check(
         "Alert test post warns the cache is unchanged",
         "cache unchanged" in (test_alert.footer.text or ""),
     )
     check(
         "Test post is visually distinct from a real alert",
-        test_alert.color.value != MacroAlerts._alert_embed(
-            "CPIAUCSL", alert_observation, None
-        ).color.value,
+        test_alert.color.value != real_alert.color.value,
+    )
+    check(
+        "The TEST tag leaves the fields untouched",
+        [field.name for field in test_alert.fields]
+        == [field.name for field in real_alert.fields]
+        and [field.value for field in test_alert.fields]
+        == [field.value for field in real_alert.fields],
+        ", ".join(field.name for field in test_alert.fields),
     )
 
     # --------------------------------------------------------- earnings result
@@ -1347,15 +1570,15 @@ async def main(live: bool = False) -> int:
         september = {
             "date": date(2026, 9, 1),
             "value": 325.4,
-            "previous": 324.1,
-            "year_ago": 315.2,
+            "previous_value": 324.1,
+            "mom": 0.20,
+            "prior_mom": 0.19,
+            "yoy": 3.10,
+            "prior_yoy": 3.05,
+            "annualized": None,
+            "prior_annualized": None,
         }
-        october = {
-            "date": date(2026, 10, 1),
-            "value": 326.9,
-            "previous": 325.4,
-            "year_ago": 316.0,
-        }
+        october = {**september, "date": date(2026, 10, 1), "value": 326.9}
 
         async def returns_september(series_id):
             return september
@@ -1363,8 +1586,13 @@ async def main(live: bool = False) -> int:
         async def returns_october(series_id):
             return october
 
+        async def no_metadata(series_id):
+            # Stubbed so posting never reaches FRED for real.
+            return None
+
         alerts = MacroAlerts(bot=None)
-        alerts._fetch_latest = returns_september
+        alerts._fetch_metrics = returns_september
+        alerts._fetch_series_info = no_metadata
 
         recording.sent.clear()
         await alerts._check_for_releases()
@@ -1374,7 +1602,7 @@ async def main(live: bool = False) -> int:
             f"{len(recording.sent)} message(s)",
         )
 
-        alerts._fetch_latest = returns_october
+        alerts._fetch_metrics = returns_october
         await alerts._check_for_releases()
         after_new = len(recording.sent)
         check(
@@ -1394,7 +1622,8 @@ async def main(live: bool = False) -> int:
         )
 
         restarted = MacroAlerts(bot=None)
-        restarted._fetch_latest = returns_october
+        restarted._fetch_metrics = returns_october
+        restarted._fetch_series_info = no_metadata
         recording.sent.clear()
         await restarted._check_for_releases()
         check(
