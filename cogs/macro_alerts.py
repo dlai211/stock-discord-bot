@@ -34,14 +34,34 @@ POLL_MINUTES = 15
 
 MONITORED_SERIES: dict[str, dict[str, Any]] = {
     "CPIAUCSL": {
-        "label": "CPI (All Urban Consumers)",
+        "label": "US Consumer Price Index (CPI)",
         "periods_per_year": 12,
         "emoji": "\U0001f4ca",
         "title": "US Consumer Price Index (CPI)",
-        "agency": "BLS",
+        "agency": "Bureau of Labor Statistics",
         "color": 0xF1C40F,
         # Only used when FRED's own units string cannot be read.
         "fallback_units": "Index 1982-1984=100",
+        "release_url": "https://www.bls.gov/news.release/cpi.nr0.htm",
+        "release_link": "Read Full BLS Release",
+        # BLS publishes headline and core in the same release, so one alert
+        # carries both rather than two firing at the same moment. MoM comes from
+        # the seasonally adjusted series and the 12-month change from the not
+        # seasonally adjusted one, which is how BLS itself reports them.
+        "components": (
+            {
+                "label": "Headline CPI",
+                "short": "Headline",
+                "sa_id": "CPIAUCSL",
+                "nsa_id": "CPIAUCNS",
+            },
+            {
+                "label": "Core CPI",
+                "short": "Core",
+                "sa_id": "CPILFESL",
+                "nsa_id": "CPILFENS",
+            },
+        ),
     },
     "PCEPILFE": {
         "label": "Core PCE Price Index",
@@ -51,6 +71,14 @@ MONITORED_SERIES: dict[str, dict[str, Any]] = {
         "agency": "BEA",
         "color": 0x9B59B6,
         "fallback_units": "Index 2017=100",
+        "components": (
+            {
+                "label": "Core PCE",
+                "short": "Core PCE",
+                "sa_id": "PCEPILFE",
+                "nsa_id": None,
+            },
+        ),
     },
     "GDPC1": {
         "label": "Real Gross Domestic Product",
@@ -60,13 +88,49 @@ MONITORED_SERIES: dict[str, dict[str, Any]] = {
         "agency": "BEA",
         "color": 0x3498DB,
         "fallback_units": "Billions of Chained 2017 Dollars",
+        "components": (
+            {
+                "label": "Real GDP",
+                "short": "Real GDP",
+                "sa_id": "GDPC1",
+                "nsa_id": None,
+            },
+        ),
     },
 }
 
-# History needed to state every rate: the latest observation, the one before it,
-# and both of their year-ago counterparts.
+
 def series_lookback_days(periods_per_year: int) -> int:
+    """Enough history to reach a year back with room to spare."""
     return int(365 * (12 / periods_per_year)) + 180
+
+
+def shift_months(stamp, months: int) -> tuple[int, int]:
+    """The (year, month) that is `months` before `stamp`."""
+    total = stamp.year * 12 + (stamp.month - 1) - months
+    return total // 12, total % 12 + 1
+
+
+def value_months_back(clean, months: int) -> float | None:
+    """The observation exactly `months` earlier, matched on the calendar.
+
+    Positional indexing — `iloc[-1 - months]` — silently breaks when the series
+    has a hole. CPIAUCSL is missing October 2025, so its 13th-from-last
+    observation is August 2025: **13** months back rather than 12, which
+    overstated year-over-year inflation by about a third of a point. Matching on
+    the date the value is supposed to represent is immune to that.
+    """
+    if clean is None or len(clean) == 0:
+        return None
+    target = shift_months(clean.index[-1], months)
+    for stamp, value in reversed(list(clean.items())):
+        position = (stamp.year, stamp.month)
+        if position == target:
+            return float(value)
+        if position < target:
+            # Walked past it, so the month is genuinely absent.
+            return None
+    return None
 
 
 def rate_metrics(clean, periods_per_year: int) -> dict[str, Any] | None:
@@ -75,20 +139,22 @@ def rate_metrics(clean, periods_per_year: int) -> dict[str, Any] | None:
     Markets trade these, not the index level: MoM and YoY for the inflation
     series, plus BEA's annualised quarter-on-quarter rate for GDP.
 
-    Returns None rather than a partial figure when there is not enough history —
-    an alert someone trades off should not carry a number that is only half
+    Returns None rather than a partial figure when a needed month is absent — an
+    alert someone trades off should not carry a number that is only half
     derivable.
     """
-    needed = periods_per_year + 2
-    if clean is None or len(clean) < needed:
+    step = 12 // periods_per_year
+    if clean is None or len(clean) < 2:
         return None
 
     latest = float(clean.iloc[-1])
-    previous = float(clean.iloc[-2])
-    prev_previous = float(clean.iloc[-3])
-    year_ago = float(clean.iloc[-1 - periods_per_year])
-    prior_year_ago = float(clean.iloc[-2 - periods_per_year])
+    previous = value_months_back(clean, step)
+    prev_previous = value_months_back(clean, step * 2)
+    year_ago = value_months_back(clean, 12)
+    prior_year_ago = value_months_back(clean, 12 + step)
 
+    if None in (previous, prev_previous, year_ago, prior_year_ago):
+        return None
     # Ratios against a zero or negative level are meaningless.
     if min(latest, previous, prev_previous, year_ago, prior_year_ago) <= 0:
         return None
@@ -111,6 +177,72 @@ def rate_metrics(clean, periods_per_year: int) -> dict[str, Any] | None:
         metrics["prior_annualized"] = ((previous / prev_previous) ** 4 - 1) * 100
 
     return metrics
+
+
+# Direction markers. U+FE0E forces text presentation, which keeps every marker a
+# single column wide inside a monospace code block — without it the pause glyph
+# renders as a double-width emoji and the table's alignment drifts.
+TEXT_PRESENTATION = "︎"
+STATUS_ACCELERATED = f"▲{TEXT_PRESENTATION} Accelerated"
+STATUS_UPTICK = f"▲{TEXT_PRESENTATION} Slight uptick"
+STATUS_INLINE = f"⏸{TEXT_PRESENTATION} In line with prior"
+STATUS_COOLDOWN = f"▼{TEXT_PRESENTATION} Slight cooldown"
+STATUS_COOLED = f"▼{TEXT_PRESENTATION} Cooled"
+
+
+def status_for(actual: float, prior: float) -> str:
+    """Plain-language direction, from the rounded one-decimal rates.
+
+    Compared in integer tenths. `0.6 - 0.4` is `0.19999999999999998` in binary
+    floating point, so a direct `diff >= 0.2` test would fail on precisely the
+    boundary this rule is written around — headline MoM at +0.6% against +0.4%
+    prior would be labelled a slight uptick instead of an acceleration.
+    """
+    diff = round(actual * 10) - round(prior * 10)
+    if diff >= 2:
+        return STATUS_ACCELERATED
+    if diff == 1:
+        return STATUS_UPTICK
+    if diff == 0:
+        return STATUS_INLINE
+    if diff == -1:
+        return STATUS_COOLDOWN
+    return STATUS_COOLED
+
+
+def base_period(units: str, fallback: str) -> str:
+    """'Index 1982-1984=100' -> 'Base 1982-1984=100'."""
+    text = (units or "").strip() or fallback
+    return f"Base {text[6:]}" if text.lower().startswith("index ") else text
+
+
+def glance_table(components: list[dict[str, Any]]) -> str:
+    """The 'Numbers at a Glance' monospace table.
+
+    Headline and core are each shown as YoY then MoM, matching the order BLS
+    uses in its own summary. Rates are rounded to one decimal, which is the
+    precision the BLS release quotes.
+    """
+    lines = [f"{'Metric':<20}{'Actual':>8}{'Prior':>8}    Status", "-" * 56]
+    for component in components:
+        label = component["label"]
+        for metric, suffix in (("yoy", "(YoY)"), ("mom", "(MoM)")):
+            actual = component[metric]
+            prior = component["prior_" + metric]
+            # Month-on-month is conventionally signed; the 12-month rate is not.
+            shown = (
+                f"{actual:+.1f}%"
+                if metric == "mom"
+                else f"{actual:.1f}%"
+            )
+            shown_prior = (
+                f"{prior:+.1f}%" if metric == "mom" else f"{prior:.1f}%"
+            )
+            lines.append(
+                f"{label + ' ' + suffix:<20}{shown:>8}{shown_prior:>8}    "
+                f"{status_for(actual, prior)}"
+            )
+    return "```\n" + "\n".join(lines) + "\n```"
 
 
 def as_mapping(info: Any) -> dict[str, Any]:
@@ -369,14 +501,8 @@ class MacroAlerts(commands.Cog):
         if seeded:
             log.info("Seeded the macro cache (no alerts sent) for: %s", ", ".join(seeded))
 
-    async def _fetch_metrics(self, series_id: str) -> dict[str, Any] | None:
-        """Rates of change for the newest observation of a series."""
-        periods_per_year = MONITORED_SERIES[series_id]["periods_per_year"]
-        start = (
-            datetime.now(timezone.utc).date()
-            - timedelta(days=series_lookback_days(periods_per_year))
-        ).isoformat()
-
+    async def _read_series(self, series_id: str, start: str):
+        """One FRED series as a clean pandas Series, or None. Blocking."""
         frame = await run_blocking(
             self._fred.get_series, series_id, observation_start=start
         )
@@ -385,13 +511,58 @@ class MacroAlerts(commands.Cog):
         if clean is None or clean.empty:
             log.warning("FRED series %s returned no usable observations", series_id)
             return None
+        return clean
 
-        metrics = rate_metrics(clean, periods_per_year)
-        if metrics is None:
-            log.warning(
-                "FRED series %s has too little history to state a rate", series_id
+    async def _fetch_metrics(self, series_id: str) -> dict[str, Any] | None:
+        """Rates of change for every component of a monitored release.
+
+        CPI carries two components, because BLS publishes headline and core
+        together. Everything else carries one.
+        """
+        meta = MONITORED_SERIES[series_id]
+        periods_per_year = meta["periods_per_year"]
+        start = (
+            datetime.now(timezone.utc).date()
+            - timedelta(days=series_lookback_days(periods_per_year))
+        ).isoformat()
+
+        components: list[dict[str, Any]] = []
+        for spec in meta["components"]:
+            mom_series = await self._read_series(spec["sa_id"], start)
+            # Where there is a separate NSA series, the 12-month change comes
+            # from it, as BLS reports it. Otherwise the SA series serves both.
+            yoy_series = (
+                await self._read_series(spec["nsa_id"], start)
+                if spec.get("nsa_id")
+                else mom_series
             )
-        return metrics
+            if mom_series is None or yoy_series is None:
+                return None
+
+            mom_rates = rate_metrics(mom_series, periods_per_year)
+            yoy_rates = rate_metrics(yoy_series, periods_per_year)
+            if mom_rates is None or yoy_rates is None:
+                log.warning(
+                    "Not enough clean history to state a rate for %s", spec["sa_id"]
+                )
+                return None
+
+            components.append(
+                {
+                    "label": spec["label"],
+                    "short": spec.get("short") or spec["label"],
+                    "date": mom_rates["date"],
+                    "value": mom_rates["value"],
+                    "mom": mom_rates["mom"],
+                    "prior_mom": mom_rates["prior_mom"],
+                    "yoy": yoy_rates["yoy"],
+                    "prior_yoy": yoy_rates["prior_yoy"],
+                    "annualized": mom_rates["annualized"],
+                    "prior_annualized": mom_rates["prior_annualized"],
+                }
+            )
+
+        return {"date": components[0]["date"], "components": components}
 
     async def _fetch_series_info(self, series_id: str) -> dict[str, Any] | None:
         """FRED metadata: the authoritative units string, and the release date.
@@ -446,6 +617,7 @@ class MacroAlerts(commands.Cog):
         """
         meta = MONITORED_SERIES[series_id]
         info = as_mapping(info)
+        components = metrics["components"]
         period = cls._period_label(metrics["date"], meta["periods_per_year"])
         units = str(info.get("units") or "").strip() or meta["fallback_units"]
 
@@ -458,52 +630,14 @@ class MacroAlerts(commands.Cog):
             color=discord.Color(0x95A5A6) if is_test else discord.Color(meta["color"]),
             timestamp=datetime.now(timezone.utc),
         )
+        if meta.get("release_url"):
+            # Turns the title into a link to the official release.
+            embed.url = meta["release_url"]
 
-        if metrics["annualized"] is not None:
-            embed.add_field(
-                name="Annualized QoQ (SAAR)",
-                value=(
-                    f"**{format_signed(metrics['annualized'], 1, '%')}**\n"
-                    f"vs {format_signed(metrics['prior_annualized'], 1, '%')} "
-                    "prior quarter"
-                ),
-                inline=True,
-            )
-            embed.add_field(
-                name="YoY Growth",
-                value=(
-                    f"**{format_signed(metrics['yoy'], 2, '%')}**\n"
-                    f"vs {format_signed(metrics['prior_yoy'], 2, '%')} prior year"
-                ),
-                inline=True,
-            )
-            embed.add_field(
-                name="Real Output",
-                value=f"${metrics['value']:,.1f}B\n{units}",
-                inline=True,
-            )
+        if len(components) > 1:
+            cls._paired_fields(embed, components, meta, units)
         else:
-            embed.add_field(
-                name="MoM Rate",
-                value=(
-                    f"**{format_signed(metrics['mom'], 2, '%')}**\n"
-                    f"vs {format_signed(metrics['prior_mom'], 2, '%')} prior month"
-                ),
-                inline=True,
-            )
-            embed.add_field(
-                name="YoY Rate",
-                value=(
-                    f"**{format_signed(metrics['yoy'], 2, '%')}**\n"
-                    f"vs {format_signed(metrics['prior_yoy'], 2, '%')} prior year"
-                ),
-                inline=True,
-            )
-            embed.add_field(
-                name="Index Level",
-                value=f"{metrics['value']:,.2f}\n{units}",
-                inline=True,
-            )
+            cls._single_fields(embed, components[0], meta, units)
 
         footer = f"Source: {meta['agency']} via FRED"
         released = release_date(info)
@@ -513,6 +647,83 @@ class MacroAlerts(commands.Cog):
             footer += " · TEST POST, release cache unchanged"
         embed.set_footer(text=footer)
         return embed
+
+    @staticmethod
+    def _paired_fields(embed, components, meta, units) -> None:
+        """Headline and core together, as a monospace table.
+
+        A table rather than inline fields: four metrics as fields would wrap
+        three-to-a-row in Discord and strand the fourth on a line of its own.
+        """
+        embed.add_field(
+            name="The Numbers at a Glance",
+            value=glance_table(components),
+            inline=False,
+        )
+        levels = " | ".join(
+            f"{component['short']} {component['value']:.2f}" for component in components
+        )
+        lines = [f"{levels} ({base_period(units, meta['fallback_units'])})"]
+        if meta.get("release_url"):
+            lines.append(
+                f"[{meta.get('release_link', 'Read the full release')}]"
+                f"({meta['release_url']})"
+            )
+        embed.add_field(
+            name="Index Levels & Official Release",
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    @staticmethod
+    def _single_fields(embed, component, meta, units) -> None:
+        """The one-component layout, used by Core PCE and Real GDP."""
+        if component["annualized"] is not None:
+            embed.add_field(
+                name="Annualized QoQ (SAAR)",
+                value=(
+                    f"**{format_signed(component['annualized'], 1, '%')}**\n"
+                    f"vs {format_signed(component['prior_annualized'], 1, '%')} "
+                    "prior quarter"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="YoY Growth",
+                value=(
+                    f"**{format_signed(component['yoy'], 2, '%')}**\n"
+                    f"vs {format_signed(component['prior_yoy'], 2, '%')} prior year"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Real Output",
+                value=f"${component['value']:,.1f}B\n{units}",
+                inline=True,
+            )
+            return
+
+        embed.add_field(
+            name="MoM Rate",
+            value=(
+                f"**{format_signed(component['mom'], 2, '%')}**\n"
+                f"vs {format_signed(component['prior_mom'], 2, '%')} prior month"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="YoY Rate",
+            value=(
+                f"**{format_signed(component['yoy'], 2, '%')}**\n"
+                f"vs {format_signed(component['prior_yoy'], 2, '%')} prior year"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Index Level",
+            value=f"{component['value']:,.2f}\n{units}",
+            inline=True,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

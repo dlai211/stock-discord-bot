@@ -287,7 +287,7 @@ of change. Every field is a rate now, with the index level demoted to context:
 
 | Series | Primary | Context |
 |---|---|---|
-| CPI | MoM rate, YoY rate | Index level (1982-84=100) |
+| CPI | headline **and** core, as a table (see below) | index levels, link to the BLS release |
 | Core PCE | MoM rate, YoY rate | Index level (2017=100) |
 | Real GDP | Annualized QoQ (SAAR), YoY growth | Real output, $B |
 
@@ -303,6 +303,45 @@ MoM Rate
 GDP uses BEA's standard annualisation, `((new / prev) ** 4 - 1) * 100`, reported
 to one decimal — `+2.2%`, not four more digits nobody quotes.
 
+#### The CPI alert is a table
+
+BLS publishes headline and core together, so one alert carries both rather than
+two firing at the same second. Four metrics as inline fields would wrap
+three-to-a-row and strand the fourth, so they go in a monospace code block:
+
+```
+Metric                Actual   Prior    Status
+--------------------------------------------------------
+Headline CPI (YoY)      3.7%    3.4%    ▲︎ Accelerated
+Headline CPI (MoM)     +0.6%   +0.4%    ▲︎ Accelerated
+Core CPI (YoY)          2.6%    2.4%    ▲︎ Accelerated
+Core CPI (MoM)         +0.3%   +0.3%    ⏸︎ In line with prior
+```
+
+A compact field below carries the index levels, the base period and a link to the
+full release; the title itself links to `cpi.nr0.htm`.
+
+**The markers carry `U+FE0E`.** The variation selector forces text presentation,
+so `▲︎`, `▼︎` and `⏸︎` are all exactly one column wide. Without it `⏸` renders as a
+double-width emoji and the Status column drifts.
+
+**Status is derived from the rounded one-decimal rates**, compared in integer
+tenths:
+
+| `diff_tenths` | Label |
+|---|---|
+| `>= 2` | ▲ Accelerated |
+| `== 1` | ▲ Slight uptick |
+| `== 0` | ⏸ In line with prior |
+| `== -1` | ▼ Slight cooldown |
+| `<= -2` | ▼ Cooled |
+
+**The tenths are not fussiness.** `0.6 - 0.4` is `0.19999999999999998` in binary
+floating point, so a direct `diff >= 0.2` test fails on precisely the boundary the
+rule is written around — headline MoM against a +0.4% prior would read as a
+slight uptick instead of an acceleration. A regression test asserts both that
+`0.6 - 0.4 < 0.2` and that the status still comes out right.
+
 Colours follow the series: gold for CPI, purple for Core PCE, blue for GDP. A
 test post overrides all three with grey.
 
@@ -315,8 +354,23 @@ cross-checked against a live pull.
 
 It returns `None` rather than a partial figure when there is not enough history
 to state every rate: a rate needs the latest pair *and* both of their year-ago
-counterparts, so 14 monthly or 6 quarterly observations. A half-derivable number
-is worse than none on an alert someone trades off.
+counterparts. A half-derivable number is worse than none on an alert someone
+trades off.
+
+**Lookups are by calendar date, not by position.** `iloc[-1 - months]` is only
+correct on a gapless series, and `CPIAUCSL` is not one: **October 2025 is missing
+from every CPI series**, so the 13th-from-last observation is August 2025 —
+thirteen months back, not twelve. That overstated year-on-year inflation by
+0.31pp (4.02% against the correct 3.72%) and core by 0.22pp, which is exactly the
+kind of gap a side-by-side comparison against the BLS release surfaces.
+
+`value_months_back()` walks the index until it finds the month the value is meant
+to represent, and returns `None` when that month is genuinely absent rather than
+quietly reaching one month further back. `PCEPILFE` and `GDPC1` are gapless, so
+for those two the two approaches agree exactly — the bug never touched them.
+
+Every offline test had passed a synthetic, gap-free series, which is why this
+went unnoticed until the numbers were checked against the actual BLS release.
 
 #### Footer
 
@@ -1671,3 +1725,84 @@ written to the log when an alert posts.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 212/212 (220/220 with `--live`) |
+
+### 2026-10-16 11:44 PT — CPI alerts rebuilt as a table, on date-based indexing
+
+**Fixed — a real off-by-one, from a cause nobody had guessed.**
+`CPIAUCSL` is missing **October 2025**. The index arithmetic was right —
+`iloc[-1 - 12]` really is `iloc[-13]` — but on a series with a hole, position
+`-13` lands **13 months back**, not 12. That overstated headline year-on-year
+inflation by **0.31pp** (4.02% against the correct 3.72%) and core by **0.22pp**.
+
+`value_months_back()` now finds the year-ago point by matching the calendar month
+it is supposed to represent, and returns `None` when that month is genuinely
+absent rather than quietly reaching one month further back.
+
+**`PCEPILFE` and `GDPC1` were never affected** — both are gapless, and for them
+the positional and date-based lookups agree to 0.00pp. The gap is unique to the
+CPI family: `CPIAUCSL`, `CPILFESL`, `CPIAUCNS` and `CPILFENS` all have it.
+
+**The SA-vs-NSA hypothesis was not the cause.** Both give 3.7% once the indexing
+is right. It does matter for MoM though, where the BLS convention holds: core MoM
+from the seasonally adjusted series is 0.3% ✓, from the not seasonally adjusted
+series it is 0.4% ✗.
+
+**Added — Core CPI.** `CPILFESL` (MoM) and `CPILFENS` (YoY) join `CPIAUCSL` /
+`CPIAUCNS`, so one alert carries headline and core together — they come from the
+same BLS release and would otherwise fire two messages in the same second.
+
+**Changed — the CPI body is a monospace table**, with the index levels and a link
+to the full release in a compact field below, and the title itself linking to
+`cpi.nr0.htm`. See §5.4.
+
+**Added — deterministic status labels**, from the rounded one-decimal rates:
+`▲ Accelerated` / `▲ Slight uptick` / `⏸ In line with prior` / `▼ Slight cooldown`
+/ `▼ Cooled`.
+
+**A floating-point trap in that rule.** `0.6 - 0.4` is `0.19999999999999998`, so a
+naive `diff >= 0.2` test fails on exactly the boundary the rule exists for —
+headline MoM against a +0.4% prior would be labelled a slight uptick instead of an
+acceleration. `status_for()` compares `round(actual*10) - round(prior*10)` in
+integer tenths.
+
+**Corrected in the request's own spec.** It stated `diff >= +0.2 → Accelerated`
+and then labelled two `+0.2` rows differently — headline MoM as *Accelerated*,
+core YoY as *Slight uptick*. Same diff, two labels. The written rule was followed.
+
+**Verified**
+- `python verify.py` — **236/236 checks passed**, exit 0.
+- `python verify.py --live` — **244/244**.
+- **The gap is a regression test.** A synthetic `CPIAUCSL` carrying the real
+  October 2025 hole must give 3.7% YoY and 3.4% prior-year — the published BLS
+  figures — and the test asserts in the same breath that `iloc[-13]` gives 4.0%,
+  so the contrast is pinned rather than described.
+- A series with the **year-ago month itself missing** must return `None`, not
+  silently reach a month further back.
+- `0.6 - 0.4 < 0.2` is asserted as a fact, next to the status it must still
+  produce — so anyone "simplifying" the tenths back to floats breaks a test that
+  explains why.
+- The full status ladder covered: `+0.3`, `+0.2`, `+0.1`, `0`, `-0.1`, `-0.2`.
+- The CPI embed asserted for field names, title, title URL, fenced code block,
+  all four metric rows **in BLS order**, every rate present, three Accelerated
+  and one In line, colour `#f1c40f`, footer attribution, both index levels, the
+  base period, and the release link. Plus that a test post is byte-identical
+  apart from its tag and colour.
+- `PCEPILFE` and `GDPC1` asserted **unchanged** — same three fields, same layout,
+  and no release link (only CPI declares one).
+- Rendered all three alerts from live FRED and read them: the CPI table came back
+  with 3.7% / 3.4% / +0.6% / +0.4% / 2.6% / 2.4% / +0.3% / +0.3%, matching the
+  BLS release exactly, with all four status values aligned at the same column.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Macro alerts rendered from live FRED | 3/3, CPI matching the BLS release to the decimal |
+| Chart timeframes resolved live | 5/5 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 236/236 (244/244 with `--live`) |

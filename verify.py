@@ -202,11 +202,20 @@ async def main(live: bool = False) -> int:
     from cogs.macro_alerts import (
         MONITORED_SERIES,
         RELEASE_WINDOWS,
+        STATUS_ACCELERATED,
+        STATUS_COOLED,
+        STATUS_COOLDOWN,
+        STATUS_INLINE,
+        STATUS_UPTICK,
         MacroAlerts,
         as_mapping,
+        base_period,
+        glance_table,
         rate_metrics,
         release_date,
         release_window_label,
+        status_for,
+        value_months_back,
     )
     from cogs.market_commands import MarketCommands
     from cogs.scheduled_briefings import (
@@ -292,38 +301,49 @@ async def main(live: bool = False) -> int:
     # ------------------------------------------------------- macro alert rates
     section("macro alert rates of change")
 
-    # Real CPIAUCSL observations. The expected rates below were computed by hand
-    # from these same numbers and cross-checked against a live FRED pull.
+    # Real CPIAUCSL observations — including the hole FRED actually has.
+    # October 2025 is absent from every CPI series, so the 13th-from-last
+    # observation is August 2025: 13 months back, not 12.
+    cpi_months = [
+        "2025-06", "2025-07", "2025-08", "2025-09",
+        # 2025-10 is the missing month.
+        "2025-11", "2025-12",
+        "2026-01", "2026-02", "2026-03", "2026-04", "2026-05",
+        "2026-06", "2026-07", "2026-08", "2026-09",
+    ]
     cpi_levels = [
-        321.44, 322.17, 323.29, 324.25, 325.06, 326.03, 326.59, 327.46,
-        330.29, 332.41, 333.98, 332.57, 332.81, 334.13, 336.30,
+        321.44, 322.17, 323.29, 324.25,
+        325.06, 326.03,
+        326.59, 327.46, 330.29, 332.41, 333.98,
+        332.57, 332.81, 334.13, 336.30,
     ]
     cpi_series = pd.Series(
-        cpi_levels, index=pd.date_range("2025-07-01", periods=len(cpi_levels), freq="MS")
+        cpi_levels, index=pd.to_datetime([f"{month}-01" for month in cpi_months])
     )
     cpi_metrics = rate_metrics(cpi_series, 12)
 
     check("CPI metrics compute", cpi_metrics is not None)
     if cpi_metrics:
+        # These four are the numbers BLS published for September 2026.
         check(
-            "CPI MoM rate",
-            round(cpi_metrics["mom"], 2) == 0.65,
-            f"{cpi_metrics['mom']:+.2f}%",
+            "CPI YoY matches the BLS release",
+            round(cpi_metrics["yoy"], 1) == 3.7,
+            f"{cpi_metrics['yoy']:+.2f}% -> 3.7%",
         )
         check(
-            "CPI prior-month rate",
-            round(cpi_metrics["prior_mom"], 2) == 0.40,
-            f"{cpi_metrics['prior_mom']:+.2f}%",
+            "CPI prior-year rate matches the BLS release",
+            round(cpi_metrics["prior_yoy"], 1) == 3.4,
+            f"{cpi_metrics['prior_yoy']:+.2f}% -> 3.4%",
         )
         check(
-            "CPI YoY rate",
-            round(cpi_metrics["yoy"], 2) == 4.02,
-            f"{cpi_metrics['yoy']:+.2f}%",
+            "CPI MoM matches the BLS release",
+            round(cpi_metrics["mom"], 1) == 0.6,
+            f"{cpi_metrics['mom']:+.2f}% -> +0.6%",
         )
         check(
-            "CPI prior-year rate",
-            round(cpi_metrics["prior_yoy"], 2) == 3.71,
-            f"{cpi_metrics['prior_yoy']:+.2f}%",
+            "CPI prior-month rate matches the BLS release",
+            round(cpi_metrics["prior_mom"], 1) == 0.4,
+            f"{cpi_metrics['prior_mom']:+.2f}% -> +0.4%",
         )
         check(
             "A monthly series reports no annualised rate",
@@ -331,13 +351,38 @@ async def main(live: bool = False) -> int:
             "annualisation is a quarterly thing only",
         )
 
-    # Real GDPC1 observations, same approach.
-    # Six observations, not five: a rate needs the latest pair *and* both of
-    # their year-ago counterparts.
+    # The contrast that makes the bug concrete: same series, two lookups.
+    positional = (cpi_series.iloc[-1] / cpi_series.iloc[-13] - 1) * 100
+    check(
+        "Positional indexing would overstate CPI YoY by a third of a point",
+        round(positional, 1) == 4.0 and round(cpi_metrics["yoy"], 1) == 3.7,
+        f"iloc[-13] = 2025-08 gives {positional:.2f}%; the date lookup gives {cpi_metrics['yoy']:.2f}%",
+    )
+    check(
+        "The lookup walks back 12 calendar months, not 12 rows",
+        value_months_back(cpi_series, 12) == cpi_series.loc["2025-09-01"],
+        f"{value_months_back(cpi_series, 12)} is September 2025",
+    )
+
+    # If the year-ago month itself is missing, refuse rather than reach further.
+    holed = pd.Series(
+        [value for month, value in zip(cpi_months, cpi_levels) if month != "2025-09"],
+        index=pd.to_datetime(
+            [f"{month}-01" for month in cpi_months if month != "2025-09"]
+        ),
+    )
+    check(
+        "A missing year-ago month states no rate at all",
+        rate_metrics(holed, 12) is None,
+        "None rather than silently reaching a month further back",
+    )
+
+    # Real GDPC1 observations. Six quarters, because a rate needs the latest
+    # pair *and* both of their year-ago counterparts.
+    gdp_months = ["2025-01", "2025-04", "2025-07", "2025-10", "2026-01", "2026-04"]
     gdp_levels = [23650.21, 23884.56, 24112.97, 24125.48, 24274.38, 24408.01]
     gdp_series = pd.Series(
-        gdp_levels,
-        index=pd.date_range("2025-01-01", periods=len(gdp_levels), freq="QS"),
+        gdp_levels, index=pd.to_datetime([f"{month}-01" for month in gdp_months])
     )
     gdp_metrics = rate_metrics(gdp_series, 4)
     check("GDP metrics compute", gdp_metrics is not None)
@@ -357,10 +402,15 @@ async def main(live: bool = False) -> int:
             round(gdp_metrics["yoy"], 2) == 2.19,
             f"{gdp_metrics['yoy']:+.2f}%",
         )
+        check(
+            "A quarter is three months, not twelve",
+            value_months_back(gdp_series, 3) == gdp_series.loc["2026-01-01"],
+            "the date lookup uses periods_per_year, not a fixed year",
+        )
 
     check(
         "Too little history states no rate at all",
-        rate_metrics(cpi_series.tail(12), 12) is None,
+        rate_metrics(cpi_series.tail(3), 12) is None,
         "a half-derivable number is worse than none",
     )
     check(
@@ -372,15 +422,59 @@ async def main(live: bool = False) -> int:
         "ratios against zero are meaningless",
     )
 
-    # --- the embed leads with those rates
-    alert_metrics = cpi_metrics
-    gdp_alert_metrics = gdp_metrics
-
-    alert = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics)
+    # --- the status ladder, and the float trap underneath it
     check(
-        "CPI fields lead with the rates, not the index level",
+        "0.6 - 0.4 really is below 0.2 in binary floating point",
+        0.6 - 0.4 < 0.2,
+        f"{0.6 - 0.4!r} — why status_for compares in tenths",
+    )
+    for actual, prior, expected, why in (
+        (3.7173, 3.3530, STATUS_ACCELERATED, "+0.3"),
+        (0.6485, 0.3960, STATUS_ACCELERATED, "+0.2 on the boundary"),
+        (2.5658, 2.4462, STATUS_ACCELERATED, "+0.2 on the boundary"),
+        (0.3348, 0.2898, STATUS_INLINE, "no change"),
+        (0.41, 0.30, STATUS_UPTICK, "+0.1"),
+        (0.30, 0.41, STATUS_COOLDOWN, "-0.1"),
+        (0.20, 0.41, STATUS_COOLED, "-0.2"),
+    ):
+        check(
+            f"Status for {actual} vs {prior} ({why})",
+            status_for(actual, prior) == expected,
+            status_for(actual, prior),
+        )
+    check(
+        "Every status marker is forced to text presentation",
+        all("︎" in marker for marker in (STATUS_ACCELERATED, STATUS_INLINE)),
+        "single-width, so the monospace table stays aligned",
+    )
+
+    # --- the CPI embed: headline and core in one table
+    def component(label, short, value, mom, prior_mom, yoy, prior_yoy, annualized=None, prior_annualized=None):
+        return {
+            "label": label,
+            "short": short,
+            "value": value,
+            "mom": mom,
+            "prior_mom": prior_mom,
+            "yoy": yoy,
+            "prior_yoy": prior_yoy,
+            "annualized": annualized,
+            "prior_annualized": prior_annualized,
+        }
+
+    cpi_alert_metrics = {
+        "date": date(2026, 9, 1),
+        "components": [
+            component("Headline CPI", "Headline", 336.30, 0.6485, 0.3960, 3.7173, 3.3530),
+            component("Core CPI", "Core", 338.90, 0.3348, 0.2898, 2.5658, 2.4462),
+        ],
+    }
+
+    alert = MacroAlerts._alert_embed("CPIAUCSL", cpi_alert_metrics)
+    check(
+        "CPI embed is a glance table plus an index field",
         [field.name for field in alert.fields]
-        == ["MoM Rate", "YoY Rate", "Index Level"],
+        == ["The Numbers at a Glance", "Index Levels & Official Release"],
         ", ".join(field.name for field in alert.fields),
     )
     check(
@@ -389,26 +483,91 @@ async def main(live: bool = False) -> int:
         alert.title,
     )
     check(
-        "CPI index level is secondary context, with its base",
-        "336.30" in alert.fields[2].value and "1982" in alert.fields[2].value,
-        alert.fields[2].value.replace("\n", " / "),
+        "CPI title links to the official BLS release",
+        alert.url == "https://www.bls.gov/news.release/cpi.nr0.htm",
+        str(alert.url),
     )
     check(
-        "CPI MoM field compares against the prior month",
-        "+0.65%" in alert.fields[0].value and "+0.40%" in alert.fields[0].value,
-        alert.fields[0].value.replace("\n", " / "),
+        "The glance table is a fenced code block",
+        alert.fields[0].value.startswith("```")
+        and alert.fields[0].value.endswith("```"),
+    )
+
+    table = alert.fields[0].value
+    check(
+        "The table lists all four metrics, headline first",
+        [
+            row
+            for row in (
+                "Headline CPI (YoY)",
+                "Headline CPI (MoM)",
+                "Core CPI (YoY)",
+                "Core CPI (MoM)",
+            )
+            if row in table
+        ]
+        == ["Headline CPI (YoY)", "Headline CPI (MoM)", "Core CPI (YoY)", "Core CPI (MoM)"],
+        "the order BLS uses",
     )
     check(
-        "CPI colour is gold",
-        alert.color.value == 0xF1C40F,
-        hex(alert.color.value),
+        "Every table row carries the BLS figures",
+        all(
+            snippet in table
+            for snippet in ("3.7%", "3.4%", "+0.6%", "+0.4%", "2.6%", "2.4%", "+0.3%")
+        ),
+        "both metrics, actual and prior",
     )
     check(
-        "CPI footer credits the BLS",
-        (alert.footer.text or "").startswith("Source: BLS via FRED"),
+        "The table states a direction for every row",
+        table.count("Accelerated") == 3 and table.count("In line with prior") == 1,
+        f"{table.count('Accelerated')} accelerated, "
+        f"{table.count('In line with prior')} unchanged",
+    )
+    check(
+        "glance_table renders one row per metric",
+        len(
+            [
+                line
+                for line in glance_table(cpi_alert_metrics["components"]).splitlines()
+                if "(YoY)" in line or "(MoM)" in line
+            ]
+        )
+        == 4,
+        "four metrics, four rows",
+    )
+    check("CPI colour is gold", alert.color.value == 0xF1C40F, hex(alert.color.value))
+    check(
+        "CPI footer credits the Bureau of Labor Statistics",
+        (alert.footer.text or "").startswith(
+            "Source: Bureau of Labor Statistics via FRED"
+        ),
         alert.footer.text,
     )
 
+    index_field = alert.fields[1].value
+    check(
+        "The index field names both levels",
+        "Headline 336.30" in index_field and "Core 338.90" in index_field,
+        index_field.replace("\n", " / "),
+    )
+    check(
+        "The index field states the base period",
+        "Base 1982-1984=100" in index_field,
+        index_field.replace("\n", " / "),
+    )
+    check(
+        "The index field links the full release",
+        "[Read Full BLS Release](https://www.bls.gov/news.release/cpi.nr0.htm)"
+        in index_field,
+    )
+
+    # --- the single-component embeds are unchanged
+    gdp_alert_metrics = {
+        "date": date(2026, 4, 1),
+        "components": [
+            component("Real GDP", "Real GDP", 24408.01, 0.5507, 0.6172, 2.1916, 2.6427, 2.217, 2.493)
+        ],
+    }
     gdp_alert = MacroAlerts._alert_embed(
         "GDPC1", gdp_alert_metrics, {"units": "Billions of Chained 2017 Dollars"}
     )
@@ -425,7 +584,7 @@ async def main(live: bool = False) -> int:
     )
     check(
         "GDP reports the annualised rate to one decimal",
-        "+2.2%" in gdp_alert.fields[0].value and "Annualized" not in gdp_alert.title,
+        "+2.2%" in gdp_alert.fields[0].value,
         gdp_alert.fields[0].value.replace("\n", " / "),
     )
     check(
@@ -433,30 +592,47 @@ async def main(live: bool = False) -> int:
         "$24,408.0B" in gdp_alert.fields[2].value,
         gdp_alert.fields[2].value.replace("\n", " / "),
     )
-    check(
-        "GDP colour is blue",
-        gdp_alert.color.value == 0x3498DB,
-        hex(gdp_alert.color.value),
-    )
+    check("GDP colour is blue", gdp_alert.color.value == 0x3498DB, hex(gdp_alert.color.value))
+    check("Only CPI declares a release link", gdp_alert.url is None)
 
+    pce_alert_metrics = {
+        "date": date(2026, 8, 1),
+        "components": [
+            component("Core PCE", "Core PCE", 130.46, 0.25, 0.13, 3.01, 2.98)
+        ],
+    }
     pce_alert = MacroAlerts._alert_embed(
-        "PCEPILFE", cpi_metrics, {"units": "Index 2017=100"}
+        "PCEPILFE", pce_alert_metrics, {"units": "Index 2017=100"}
     )
     check(
         "Core PCE title matches the spec",
         pce_alert.title
-        == "\U0001f4ca US Core PCE Price Index (Fed's Preferred Gauge) — September 2026",
+        == "\U0001f4ca US Core PCE Price Index (Fed's Preferred Gauge) — August 2026",
         pce_alert.title,
     )
     check(
-        "Core PCE colour is purple",
-        pce_alert.color.value == 0x9B59B6,
-        hex(pce_alert.color.value),
+        "Core PCE keeps the three-field layout",
+        [field.name for field in pce_alert.fields]
+        == ["MoM Rate", "YoY Rate", "Index Level"],
+        ", ".join(field.name for field in pce_alert.fields),
     )
+    check("Core PCE colour is purple", pce_alert.color.value == 0x9B59B6, hex(pce_alert.color.value))
     check(
         "Core PCE footer credits the BEA",
         (pce_alert.footer.text or "").startswith("Source: BEA via FRED"),
         pce_alert.footer.text,
+    )
+
+    # --- units come from FRED, and the base period is derived from them
+    check(
+        "base_period turns FRED's wording into a base period",
+        base_period("Index 1982-1984=100", "unused") == "Base 1982-1984=100",
+        base_period("Index 1982-1984=100", "unused"),
+    )
+    check(
+        "base_period falls back when FRED gives nothing",
+        base_period("", "Index 2017=100") == "Base 2017=100",
+        base_period("", "Index 2017=100"),
     )
 
     # --- release date and units come from FRED's own metadata
@@ -485,7 +661,7 @@ async def main(live: bool = False) -> int:
         release_date(series_info) == date(2026, 9, 30),
         str(release_date(series_info)),
     )
-    from_series = MacroAlerts._alert_embed("PCEPILFE", alert_metrics, series_info)
+    from_series = MacroAlerts._alert_embed("PCEPILFE", pce_alert_metrics, series_info)
     check(
         "An alert renders from Series metadata",
         "Index 2017=100" in from_series.fields[2].value,
@@ -493,18 +669,18 @@ async def main(live: bool = False) -> int:
     )
 
     dated = MacroAlerts._alert_embed(
-        "CPIAUCSL", alert_metrics, {"last_updated": "2026-10-14 08:08:29-05"}
+        "CPIAUCSL", cpi_alert_metrics, {"last_updated": "2026-10-14 08:08:29-05"}
     )
     check(
         "The footer carries the release date",
         "Released Oct 14, 2026" in (dated.footer.text or ""),
         dated.footer.text,
     )
-    fallback_units = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics)
+    fallback_units = MacroAlerts._alert_embed("CPIAUCSL", cpi_alert_metrics)
     check(
         "Without metadata the configured base period is used",
-        "1982" in fallback_units.fields[2].value,
-        fallback_units.fields[2].value.replace("\n", " / "),
+        "Base 1982-1984=100" in fallback_units.fields[1].value,
+        fallback_units.fields[1].value.replace("\n", " / "),
     )
     check(
         "Every macro alert field fits Discord's cap",
@@ -1474,8 +1650,8 @@ async def main(live: bool = False) -> int:
         "TEST POST" in (test_briefing.footer.text or ""),
     )
 
-    test_alert = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics, is_test=True)
-    real_alert = MacroAlerts._alert_embed("CPIAUCSL", alert_metrics)
+    test_alert = MacroAlerts._alert_embed("CPIAUCSL", cpi_alert_metrics, is_test=True)
+    real_alert = MacroAlerts._alert_embed("CPIAUCSL", cpi_alert_metrics)
     check(
         "Alert test post is labelled",
         test_alert.title.startswith("[TEST] "),
@@ -1569,16 +1745,21 @@ async def main(live: bool = False) -> int:
 
         september = {
             "date": date(2026, 9, 1),
-            "value": 325.4,
-            "previous_value": 324.1,
-            "mom": 0.20,
-            "prior_mom": 0.19,
-            "yoy": 3.10,
-            "prior_yoy": 3.05,
-            "annualized": None,
-            "prior_annualized": None,
+            "components": [
+                {
+                    "label": "Core PCE",
+                    "short": "Core PCE",
+                    "value": 130.46,
+                    "mom": 0.25,
+                    "prior_mom": 0.13,
+                    "yoy": 3.01,
+                    "prior_yoy": 2.98,
+                    "annualized": None,
+                    "prior_annualized": None,
+                }
+            ],
         }
-        october = {**september, "date": date(2026, 10, 1), "value": 326.9}
+        october = {**september, "date": date(2026, 10, 1)}
 
         async def returns_september(series_id):
             return september
