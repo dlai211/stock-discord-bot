@@ -720,26 +720,25 @@ class MacroAlerts(commands.Cog):
             )
             return
 
+        # The inflation reading carries its measure as the field name and its
+        # two periods as lines underneath, exactly as the CPI alert does. Only
+        # GDP still uses the older fixed-field shape, because annualised QoQ has
+        # no YoY/MoM pair to line up against.
         embed.add_field(
-            name="MoM Rate",
-            value=(
-                f"**{format_signed(component['mom'], 2, '%')}**\n"
-                f"vs {format_signed(component['prior_mom'], 2, '%')} prior month"
+            name=component["label"],
+            value="\n".join(
+                metric_line(component, metric, label)
+                for metric, label in PERIOD_LABELS
             ),
-            inline=True,
-        )
-        embed.add_field(
-            name="YoY Rate",
-            value=(
-                f"**{format_signed(component['yoy'], 2, '%')}**\n"
-                f"vs {format_signed(component['prior_yoy'], 2, '%')} prior year"
-            ),
-            inline=True,
+            inline=False,
         )
         embed.add_field(
             name="Index Level",
-            value=f"{component['value']:,.2f}\n{units}",
-            inline=True,
+            value=(
+                f"{component['value']:,.2f} "
+                f"({base_period(units, meta['fallback_units'])})"
+            ),
+            inline=False,
         )
 
 

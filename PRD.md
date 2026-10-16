@@ -287,9 +287,14 @@ of change. Every field is a rate now, with the index level demoted to context:
 
 | Series | Primary | Context |
 |---|---|---|
-| CPI | headline **and** core, as a table (see below) | index levels, link to the BLS release |
-| Core PCE | MoM rate, YoY rate | Index level (2017=100) |
-| Real GDP | Annualized QoQ (SAAR), YoY growth | Real output, $B |
+| CPI | headline **and** core, one full-width field each | index levels, link to the BLS release |
+| Core PCE | one field, YoY above MoM | index level (2017=100) |
+| Real GDP | Annualized QoQ (SAAR), YoY growth | real output, $B |
+
+CPI and Core PCE share a body: **a field named for the measure, holding one
+`metric_line()` per period**. Only GDP still uses the older fixed-field shape —
+its headline figure is an annualised quarterly rate, which has no YoY/MoM pair to
+line up against.
 
 Each headline carries the previous period's rate beside it, so acceleration and
 deceleration are visible without a second lookup:
@@ -1968,3 +1973,56 @@ longer does alignment work — it now stops `⏸` rendering as a colour emoji wh
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 240/240 (248/248 with `--live`) |
+
+### 2026-10-16 12:42 PT — Core PCE adopts the CPI body
+
+**Changed — Core PCE is now one field per measure, not three fixed fields.**
+
+```
+[ MoM Rate ]                    [ Core PCE ]
+   **+0.25%**                      YoY **3.0%** · ⏸︎ Flat · was 3.0%
+   vs +0.13% prior month     →     MoM **+0.2%** · ▲︎ Uptick · was +0.1%
+[ YoY Rate ]       ...
+   **+3.01%**                   [ Index Level ]
+   vs +2.98% prior year            130.46 (Base 2017=100)
+[ Index Level ]
+   130.46
+```
+
+Same `metric_line()` format as CPI, same short status wording, same full-width
+fields. The measure name is the field name, and the two periods are lines
+underneath it.
+
+**Real GDP is unchanged** and still uses the fixed-field layout. Its headline
+figure is an annualised quarterly rate with no YoY/MoM pair to line up against, so
+it does not map onto the same shape. Happy to reshape it if you want the three
+alerts identical.
+
+**Verified**
+- `python verify.py` — **243/243 checks passed**, exit 0.
+- `python verify.py --live` — **251/251**.
+- Asserted the Core PCE field names, that the first line is exactly
+  `YoY **3.0%** · ⏸︎ Flat · was 3.0%`, that the fields are full width, and that
+  no field contains a code fence.
+- Rendered all three alerts from live FRED. Core PCE came back
+  `YoY 3.0% · ⏸︎ Flat · was 3.0%` and `MoM +0.2% · ▲︎ Uptick · was +0.1%`.
+
+**Worth noting from that render.** Core PCE year over year is 3.01% against
+2.98% prior, and **both round to 3.0%**, so it correctly reads *Flat* rather than
+an acceleration. The rounding decides the label — which is exactly why the status
+compares `round(actual * 10) - round(prior * 10)` rather than the raw difference.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Macro alerts rendered from live FRED | 3/3, CPI matching the BLS release to the decimal |
+| Alerts sharing the `metric_line()` body | 2 of 3 (CPI, Core PCE) |
+| Chart timeframes resolved live | 5/5 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 243/243 (251/251 with `--live`) |

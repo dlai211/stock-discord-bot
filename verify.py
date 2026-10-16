@@ -616,10 +616,25 @@ async def main(live: bool = False) -> int:
         pce_alert.title,
     )
     check(
-        "Core PCE keeps the three-field layout",
-        [field.name for field in pce_alert.fields]
-        == ["MoM Rate", "YoY Rate", "Index Level"],
+        "Core PCE uses the CPI field shape",
+        [field.name for field in pce_alert.fields] == ["Core PCE", "Index Level"],
         ", ".join(field.name for field in pce_alert.fields),
+    )
+    # 3.01 against 2.98 both round to 3.0, so this reads as flat rather than an
+    # acceleration — the rounding really does decide the label.
+    check(
+        "Core PCE readings use the same line format as CPI",
+        pce_alert.fields[0].value.split("\n")[0]
+        == "YoY **3.0%** · ⏸︎ Flat · was 3.0%",
+        pce_alert.fields[0].value.replace("\n", " / "),
+    )
+    check(
+        "Core PCE fields are full width, like the CPI ones",
+        all(field.inline is False for field in pce_alert.fields),
+    )
+    check(
+        "Core PCE carries no code block",
+        not any("```" in field.value for field in pce_alert.fields),
     )
     check("Core PCE colour is purple", pce_alert.color.value == 0x9B59B6, hex(pce_alert.color.value))
     check(
@@ -669,8 +684,8 @@ async def main(live: bool = False) -> int:
     from_series = MacroAlerts._alert_embed("PCEPILFE", pce_alert_metrics, series_info)
     check(
         "An alert renders from Series metadata",
-        "Index 2017=100" in from_series.fields[2].value,
-        from_series.fields[2].value.replace("\n", " / "),
+        "Base 2017=100" in from_series.fields[1].value,
+        from_series.fields[1].value,
     )
 
     dated = MacroAlerts._alert_embed(
