@@ -494,20 +494,23 @@ async def main(live: bool = False) -> int:
     )
 
     table = alert.fields[0].value
+    table_lines = table.strip("`\n").split("\n")
+
+    def row_labels(lines):
+        """Measure headings and metric rows, in the order they appear."""
+        found = []
+        for line in lines:
+            text = line.strip()
+            if text in ("Headline", "Core"):
+                found.append(text)
+            elif text[:3] in ("YoY", "MoM"):
+                found.append(text[:3])
+        return found
+
     check(
-        "The table lists all four metrics, headline first",
-        [
-            row
-            for row in (
-                "Headline CPI (YoY)",
-                "Headline CPI (MoM)",
-                "Core CPI (YoY)",
-                "Core CPI (MoM)",
-            )
-            if row in table
-        ]
-        == ["Headline CPI (YoY)", "Headline CPI (MoM)", "Core CPI (YoY)", "Core CPI (MoM)"],
-        "the order BLS uses",
+        "The table groups by measure, YoY above MoM",
+        row_labels(table_lines) == ["Headline", "YoY", "MoM", "Core", "YoY", "MoM"],
+        "the order BLS uses in its own summary",
     )
     check(
         "Every table row carries the BLS figures",
@@ -515,25 +518,46 @@ async def main(live: bool = False) -> int:
             snippet in table
             for snippet in ("3.7%", "3.4%", "+0.6%", "+0.4%", "2.6%", "2.4%", "+0.3%")
         ),
-        "both metrics, actual and prior",
+        "both measures, actual and prior",
     )
     check(
         "The table states a direction for every row",
-        table.count("Accelerated") == 3 and table.count("In line with prior") == 1,
-        f"{table.count('Accelerated')} accelerated, "
-        f"{table.count('In line with prior')} unchanged",
+        table.count("Accel") == 3 and table.count("Flat") == 1,
+        f"{table.count('Accel')} accelerated, {table.count('Flat')} flat",
     )
     check(
-        "glance_table renders one row per metric",
-        len(
-            [
-                line
-                for line in glance_table(cpi_alert_metrics["components"]).splitlines()
-                if "(YoY)" in line or "(MoM)" in line
-            ]
-        )
-        == 4,
+        "The table renders one row per metric",
+        len([label for label in row_labels(table_lines) if label in ("YoY", "MoM")]) == 4,
         "four metrics, four rows",
+    )
+    widest = max(len(line) for line in table_lines)
+    check(
+        "The table fits a phone without scrolling sideways",
+        widest <= 40,
+        f"widest row is {widest} columns, down from 62",
+    )
+    check(
+        "The table never repeats 'CPI' on a row",
+        "CPI" not in table,
+        "the title and the measure headings already say it",
+    )
+    check(
+        "The table uses the short status wording",
+        status_for(3.7173, 3.3530, short=True) == "▲︎ Accel",
+        status_for(3.7173, 3.3530, short=True),
+    )
+    check(
+        "The long status wording is still the default",
+        status_for(3.7173, 3.3530) == STATUS_ACCELERATED,
+        status_for(3.7173, 3.3530),
+    )
+    check(
+        "Every short status fits the trend column",
+        all(
+            len(status_for(actual, prior, short=True)) <= 10
+            for actual, prior in ((0.6, 0.4), (0.4, 0.3), (0.3, 0.3), (0.3, 0.4), (0.2, 0.4))
+        ),
+        "so the column never runs long",
     )
     check("CPI colour is gold", alert.color.value == 0xF1C40F, hex(alert.color.value))
     check(

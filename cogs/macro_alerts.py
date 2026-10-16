@@ -190,7 +190,19 @@ STATUS_COOLDOWN = f"▼{TEXT_PRESENTATION} Slight cooldown"
 STATUS_COOLED = f"▼{TEXT_PRESENTATION} Cooled"
 
 
-def status_for(actual: float, prior: float) -> str:
+# The table has to fit a phone without scrolling sideways, so each status also
+# carries a short form. The long wording stays the default, and is what any
+# non-tabular rendering would use.
+STATUS_SHORT = {
+    STATUS_ACCELERATED: f"▲{TEXT_PRESENTATION} Accel",
+    STATUS_UPTICK: f"▲{TEXT_PRESENTATION} Uptick",
+    STATUS_INLINE: f"⏸{TEXT_PRESENTATION} Flat",
+    STATUS_COOLDOWN: f"▼{TEXT_PRESENTATION} Cooling",
+    STATUS_COOLED: f"▼{TEXT_PRESENTATION} Cooled",
+}
+
+
+def status_for(actual: float, prior: float, *, short: bool = False) -> str:
     """Plain-language direction, from the rounded one-decimal rates.
 
     Compared in integer tenths. `0.6 - 0.4` is `0.19999999999999998` in binary
@@ -200,14 +212,16 @@ def status_for(actual: float, prior: float) -> str:
     """
     diff = round(actual * 10) - round(prior * 10)
     if diff >= 2:
-        return STATUS_ACCELERATED
-    if diff == 1:
-        return STATUS_UPTICK
-    if diff == 0:
-        return STATUS_INLINE
-    if diff == -1:
-        return STATUS_COOLDOWN
-    return STATUS_COOLED
+        label = STATUS_ACCELERATED
+    elif diff == 1:
+        label = STATUS_UPTICK
+    elif diff == 0:
+        label = STATUS_INLINE
+    elif diff == -1:
+        label = STATUS_COOLDOWN
+    else:
+        label = STATUS_COOLED
+    return STATUS_SHORT[label] if short else label
 
 
 def base_period(units: str, fallback: str) -> str:
@@ -216,31 +230,42 @@ def base_period(units: str, fallback: str) -> str:
     return f"Base {text[6:]}" if text.lower().startswith("index ") else text
 
 
+# Column widths for the glance table, chosen so the widest row stays inside the
+# roughly 35 monospace columns a phone shows before a code block scrolls
+# sideways. A flat four-row table with the full status wording ran to 62.
+TABLE_METRIC_WIDTH = 10
+TABLE_VALUE_WIDTH = 7
+TABLE_TREND_GAP = 3
+
+
 def glance_table(components: list[dict[str, Any]]) -> str:
     """The 'Numbers at a Glance' monospace table.
 
-    Headline and core are each shown as YoY then MoM, matching the order BLS
-    uses in its own summary. Rates are rounded to one decimal, which is the
-    precision the BLS release quotes.
+    Grouped by measure rather than flattened, so headline and core stay visually
+    separate and "CPI" is not repeated on every row. Each group shows the
+    12-month change above the one-month change, matching the order BLS uses in
+    its own summary, and rates carry the single decimal the release quotes.
     """
-    lines = [f"{'Metric':<20}{'Actual':>8}{'Prior':>8}    Status", "-" * 56]
+    lines = [
+        f"{'Metric':<{TABLE_METRIC_WIDTH}}"
+        f"{'Actual':>{TABLE_VALUE_WIDTH}}"
+        f"{'Prior':>{TABLE_VALUE_WIDTH}}"
+        f"{' ' * TABLE_TREND_GAP}Trend"
+    ]
     for component in components:
-        label = component["label"]
-        for metric, suffix in (("yoy", "(YoY)"), ("mom", "(MoM)")):
+        lines.append(component["short"])
+        for metric, suffix in (("yoy", "YoY"), ("mom", "MoM")):
             actual = component[metric]
             prior = component["prior_" + metric]
             # Month-on-month is conventionally signed; the 12-month rate is not.
-            shown = (
-                f"{actual:+.1f}%"
-                if metric == "mom"
-                else f"{actual:.1f}%"
-            )
-            shown_prior = (
-                f"{prior:+.1f}%" if metric == "mom" else f"{prior:.1f}%"
-            )
+            shown = f"{actual:+.1f}%" if metric == "mom" else f"{actual:.1f}%"
+            shown_prior = f"{prior:+.1f}%" if metric == "mom" else f"{prior:.1f}%"
             lines.append(
-                f"{label + ' ' + suffix:<20}{shown:>8}{shown_prior:>8}    "
-                f"{status_for(actual, prior)}"
+                f"{'  ' + suffix:<{TABLE_METRIC_WIDTH}}"
+                f"{shown:>{TABLE_VALUE_WIDTH}}"
+                f"{shown_prior:>{TABLE_VALUE_WIDTH}}"
+                f"{' ' * TABLE_TREND_GAP}"
+                f"{status_for(actual, prior, short=True)}"
             )
     return "```\n" + "\n".join(lines) + "\n```"
 

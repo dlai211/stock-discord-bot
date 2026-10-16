@@ -307,16 +307,35 @@ to one decimal — `+2.2%`, not four more digits nobody quotes.
 
 BLS publishes headline and core together, so one alert carries both rather than
 two firing at the same second. Four metrics as inline fields would wrap
-three-to-a-row and strand the fourth, so they go in a monospace code block:
+three-to-a-row and strand the fourth, so they go in a monospace code block —
+**grouped by measure rather than flattened**:
 
 ```
-Metric                Actual   Prior    Status
---------------------------------------------------------
-Headline CPI (YoY)      3.7%    3.4%    ▲︎ Accelerated
-Headline CPI (MoM)     +0.6%   +0.4%    ▲︎ Accelerated
-Core CPI (YoY)          2.6%    2.4%    ▲︎ Accelerated
-Core CPI (MoM)         +0.3%   +0.3%    ⏸︎ In line with prior
+Metric     Actual  Prior   Trend
+Headline
+  YoY        3.7%   3.4%   ▲︎ Accel
+  MoM       +0.6%  +0.4%   ▲︎ Accel
+Core
+  YoY        2.6%   2.4%   ▲︎ Accel
+  MoM       +0.3%  +0.3%   ⏸︎ Flat
 ```
+
+**Width is the binding constraint.** A code block scrolls sideways rather than
+wrapping, and a phone shows roughly 35 monospace columns. A flat four-row version
+with the full status wording ran to **62 columns**, which pushed the trend — the
+one column you would actually scan — off the right edge on mobile. The grouped
+form is **35**, and both a code comment and a test pin the ceiling at 40.
+
+Three changes buy that width back:
+
+| Change | Saves |
+|---|---|
+| Headline/Core become group headings instead of a prefix on every row | `CPI` on 4 rows |
+| Status wording shortens — Accel, Uptick, Flat, Cooling, Cooled | ~8 chars per row |
+| The period moves to its own column instead of repeating inside the label | ~4 chars per row |
+
+The long wording is still what `status_for()` returns by default. `short=True` is
+for the table alone, so any future non-tabular rendering keeps the full labels.
 
 A compact field below carries the index levels, the base period and a link to the
 full release; the title itself links to `cpi.nr0.htm`.
@@ -1806,3 +1825,61 @@ core YoY as *Slight uptick*. Same diff, two labels. The written rule was followe
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 236/236 (244/244 with `--live`) |
+
+### 2026-10-16 12:20 PT — CPI table regrouped to fit a phone
+
+**Changed — the glance table is grouped by measure, and nearly half as wide.**
+
+```
+Metric     Actual  Prior   Trend          Metric                Actual   Prior    Status
+Headline                                 Headline CPI (YoY)      3.7%    3.4%    ▲︎ Accelerated
+  YoY        3.7%   3.4%   ▲︎ Accel        Headline CPI (MoM)     +0.6%   +0.4%    ▲︎ Accelerated
+  MoM       +0.6%  +0.4%   ▲︎ Accel   →    Core CPI (YoY)          2.6%    2.4%    ▲︎ Accelerated
+Core                                     Core CPI (MoM)         +0.3%   +0.3%    ⏸︎ In line with prior
+  YoY        2.6%   2.4%   ▲︎ Accel
+  MoM       +0.3%  +0.3%   ⏸︎ Flat                  35 columns        62 columns
+```
+
+**Why.** A code block scrolls sideways instead of wrapping, and a phone shows
+about 35 monospace columns. At 62, the trend — the column you would scan for —
+was the first thing off the right edge. Headline and core became group headings
+instead of a prefix on every row, and the status wording gained short forms.
+
+**The long labels are unchanged.** `status_for()` still returns `▲ Accelerated`,
+`▼ Slight cooldown` and so on by default; `short=True` is used only by the table,
+so any future non-tabular rendering keeps the full wording.
+
+**Verified**
+- `python verify.py` — **241/241 checks passed**, exit 0.
+- `python verify.py --live` — **249/249**.
+- The table's width is now asserted: `widest <= 40`, reported as *"widest row is
+  35 columns, down from 62"*, so a future addition that widens it fails with the
+  reason attached rather than silently pushing the trend off-screen.
+- Asserted the table **never contains "CPI"** — the title and the measure
+  headings already say it.
+- Asserted the row order is Headline → YoY → MoM → Core → YoY → MoM, and that
+  all four metric rows still carry the published figures.
+- Asserted every short status fits the trend column (≤ 10 characters) and that
+  the long wording remains the default.
+- Rendered from live FRED: 35 columns, field value 197 of 1,024 characters.
+
+**Note on the test that failed first.** Two checks reported failures against a
+table that was rendering correctly — the *test* was wrong. `"  YoY    3.7%…".strip()`
+is the whole row, not `"YoY"`, so only the group headings matched the filter. The
+row parser now reads the leading token. Worth recording because it looked like a
+layout bug and was not.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Macro alerts rendered from live FRED | 3/3, CPI matching the BLS release to the decimal |
+| CPI table width | 35 columns (ceiling 40, was 62) |
+| Chart timeframes resolved live | 5/5 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 241/241 (249/249 with `--live`) |
