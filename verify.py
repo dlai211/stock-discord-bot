@@ -210,7 +210,7 @@ async def main(live: bool = False) -> int:
         MacroAlerts,
         as_mapping,
         base_period,
-        glance_table,
+        metric_line,
         rate_metrics,
         release_date,
         release_window_label,
@@ -472,9 +472,9 @@ async def main(live: bool = False) -> int:
 
     alert = MacroAlerts._alert_embed("CPIAUCSL", cpi_alert_metrics)
     check(
-        "CPI embed is a glance table plus an index field",
+        "CPI embed is one field per measure plus an index field",
         [field.name for field in alert.fields]
-        == ["The Numbers at a Glance", "Index Levels & Official Release"],
+        == ["Headline CPI", "Core CPI", "Index Levels & Official Release"],
         ", ".join(field.name for field in alert.fields),
     )
     check(
@@ -488,76 +488,57 @@ async def main(live: bool = False) -> int:
         str(alert.url),
     )
     check(
-        "The glance table is a fenced code block",
-        alert.fields[0].value.startswith("```")
-        and alert.fields[0].value.endswith("```"),
-    )
-
-    table = alert.fields[0].value
-    table_lines = table.strip("`\n").split("\n")
-
-    def row_labels(lines):
-        """Measure headings and metric rows, in the order they appear."""
-        found = []
-        for line in lines:
-            text = line.strip()
-            if text in ("Headline", "Core"):
-                found.append(text)
-            elif text[:3] in ("YoY", "MoM"):
-                found.append(text[:3])
-        return found
-
-    check(
-        "The table groups by measure, YoY above MoM",
-        row_labels(table_lines) == ["Headline", "YoY", "MoM", "Core", "YoY", "MoM"],
-        "the order BLS uses in its own summary",
+        "No part of the CPI alert is a code block",
+        not any("```" in field.value for field in alert.fields),
+        "fields render in Discord's own typography",
     )
     check(
-        "Every table row carries the BLS figures",
+        "Every measure field is full width",
+        all(field.inline is False for field in alert.fields),
+        "a third-width inline field would wrap these lines",
+    )
+
+    headline_lines = alert.fields[0].value.split("\n")
+    check(
+        "The headline field shows YoY above MoM",
+        [line[:3] for line in headline_lines] == ["YoY", "MoM"],
+        " · ".join(headline_lines),
+    )
+    check(
+        "A measure field is exactly two lines",
+        all(len(field.value.split("\n")) == 2 for field in alert.fields[:2]),
+        "one reading per period, nothing wrapping by design",
+    )
+    rendered = " ".join(field.value for field in alert.fields)
+    check(
+        "Every figure from the BLS release is present",
         all(
-            snippet in table
+            snippet in rendered
             for snippet in ("3.7%", "3.4%", "+0.6%", "+0.4%", "2.6%", "2.4%", "+0.3%")
         ),
         "both measures, actual and prior",
     )
     check(
-        "The table states a direction for every row",
-        table.count("Accel") == 3 and table.count("Flat") == 1,
-        f"{table.count('Accel')} accelerated, {table.count('Flat')} flat",
+        "The alert uses the short status wording",
+        rendered.count("Accel") == 3 and rendered.count("Flat") == 1,
+        f"{rendered.count('Accel')} accel, {rendered.count('Flat')} flat",
     )
     check(
-        "The table renders one row per metric",
-        len([label for label in row_labels(table_lines) if label in ("YoY", "MoM")]) == 4,
-        "four metrics, four rows",
-    )
-    widest = max(len(line) for line in table_lines)
-    check(
-        "The table fits a phone without scrolling sideways",
-        widest <= 40,
-        f"widest row is {widest} columns, down from 62",
+        "metric_line reads value first, direction next, prior last",
+        metric_line(cpi_alert_metrics["components"][0], "yoy", "YoY")
+        == "YoY **3.7%** · ▲︎ Accel · was 3.4%",
+        metric_line(cpi_alert_metrics["components"][0], "yoy", "YoY"),
     )
     check(
-        "The table never repeats 'CPI' on a row",
-        "CPI" not in table,
-        "the title and the measure headings already say it",
-    )
-    check(
-        "The table uses the short status wording",
-        status_for(3.7173, 3.3530, short=True) == "▲︎ Accel",
-        status_for(3.7173, 3.3530, short=True),
+        "metric_line signs month-on-month but not the 12-month rate",
+        metric_line(cpi_alert_metrics["components"][1], "mom", "MoM")
+        == "MoM **+0.3%** · ⏸︎ Flat · was +0.3%",
+        metric_line(cpi_alert_metrics["components"][1], "mom", "MoM"),
     )
     check(
         "The long status wording is still the default",
         status_for(3.7173, 3.3530) == STATUS_ACCELERATED,
         status_for(3.7173, 3.3530),
-    )
-    check(
-        "Every short status fits the trend column",
-        all(
-            len(status_for(actual, prior, short=True)) <= 10
-            for actual, prior in ((0.6, 0.4), (0.4, 0.3), (0.3, 0.3), (0.3, 0.4), (0.2, 0.4))
-        ),
-        "so the column never runs long",
     )
     check("CPI colour is gold", alert.color.value == 0xF1C40F, hex(alert.color.value))
     check(
@@ -568,7 +549,7 @@ async def main(live: bool = False) -> int:
         alert.footer.text,
     )
 
-    index_field = alert.fields[1].value
+    index_field = alert.fields[2].value
     check(
         "The index field names both levels",
         "Headline 336.30" in index_field and "Core 338.90" in index_field,
@@ -703,8 +684,8 @@ async def main(live: bool = False) -> int:
     fallback_units = MacroAlerts._alert_embed("CPIAUCSL", cpi_alert_metrics)
     check(
         "Without metadata the configured base period is used",
-        "Base 1982-1984=100" in fallback_units.fields[1].value,
-        fallback_units.fields[1].value.replace("\n", " / "),
+        "Base 1982-1984=100" in fallback_units.fields[2].value,
+        fallback_units.fields[2].value.replace("\n", " / "),
     )
     check(
         "Every macro alert field fits Discord's cap",

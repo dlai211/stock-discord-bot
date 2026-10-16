@@ -303,46 +303,55 @@ MoM Rate
 GDP uses BEA's standard annualisation, `((new / prev) ** 4 - 1) * 100`, reported
 to one decimal — `+2.2%`, not four more digits nobody quotes.
 
-#### The CPI alert is a table
+#### The CPI alert contains no code block
 
 BLS publishes headline and core together, so one alert carries both rather than
-two firing at the same second. Four metrics as inline fields would wrap
-three-to-a-row and strand the fourth, so they go in a monospace code block —
-**grouped by measure rather than flattened**:
+two firing at the same second. Each becomes its own field, and Discord's field
+headers do the grouping:
 
 ```
-Metric     Actual  Prior   Trend
-Headline
-  YoY        3.7%   3.4%   ▲︎ Accel
-  MoM       +0.6%  +0.4%   ▲︎ Accel
-Core
-  YoY        2.6%   2.4%   ▲︎ Accel
-  MoM       +0.3%  +0.3%   ⏸︎ Flat
+[ Headline CPI ]
+YoY **3.7%** · ▲︎ Accel · was 3.4%
+MoM **+0.6%** · ▲︎ Accel · was +0.4%
+
+[ Core CPI ]
+YoY **2.6%** · ▲︎ Accel · was 2.4%
+MoM **+0.3%** · ⏸︎ Flat · was +0.3%
+
+[ Index Levels & Official Release ]
+Headline 336.30 | Core 338.90 (Base 1982-1984=100)
+Read Full BLS Release
 ```
 
-**Width is the binding constraint.** A code block scrolls sideways rather than
-wrapping, and a phone shows roughly 35 monospace columns. A flat four-row version
-with the full status wording ran to **62 columns**, which pushed the trend — the
-one column you would actually scan — off the right edge on mobile. The grouped
-form is **35**, and both a code comment and a test pin the ceiling at 40.
+**There is no way to align columns in Discord outside a code block.** Messages
+and field values render in a proportional font, where `3.7%` and `+0.6%` are
+different widths, so space padding can never line anything up. Inline code is
+monospace but cannot span lines. The only monospace context that spans lines *is*
+a code block — and a code block scrolls sideways rather than wrapping, which on a
+phone pushed the trend column off the right edge.
 
-Three changes buy that width back:
+So this layout does not attempt alignment. It leans on what Discord is actually
+good at — **field headers group**, **bold emphasises**, **lines wrap instead of
+scrolling** — and reads the same on a phone as on a desktop.
 
-| Change | Saves |
-|---|---|
-| Headline/Core become group headings instead of a prefix on every row | `CPI` on 4 rows |
-| Status wording shortens — Accel, Uptick, Flat, Cooling, Cooled | ~8 chars per row |
-| The period moves to its own column instead of repeating inside the label | ~4 chars per row |
+**The fields are full width, not inline.** Discord gives an inline field a third
+of the embed, roughly eighteen characters; these lines run about thirty-six.
+Inline would wrap every reading mid-thought.
 
-The long wording is still what `status_for()` returns by default. `short=True` is
-for the table alone, so any future non-tabular rendering keeps the full labels.
+Two earlier layouts are preserved in git history at `a21af6a`: the monospace
+table, and the flat four-row one before it.
 
-A compact field below carries the index levels, the base period and a link to the
-full release; the title itself links to `cpi.nr0.htm`.
+#### Status wording
 
-**The markers carry `U+FE0E`.** The variation selector forces text presentation,
-so `▲︎`, `▼︎` and `⏸︎` are all exactly one column wide. Without it `⏸` renders as a
-double-width emoji and the Status column drifts.
+The alert body uses the **short set** — `Accel`, `Uptick`, `Flat`, `Cooling`,
+`Cooled`. The long wording (`▲︎ Accelerated`, `⏸︎ In line with prior`) is still what
+`status_for()` returns by default; `short=True` is what the CPI body asks for. Any
+future rendering with more room gets the full labels for free.
+
+**The markers carry `U+FE0E`.** The variation selector forces text presentation.
+Outside a code block this is no longer an alignment device — it keeps the set
+consistent, because `⏸` defaults to a colour emoji while `▲` and `▼` do not, and
+a row mixing one colour glyph with two monochrome ones reads as a mistake.
 
 **Status is derived from the rounded one-decimal rates**, compared in integer
 tenths:
@@ -1883,3 +1892,79 @@ layout bug and was not.
 | Tracked files containing a secret | 0 |
 | Byte-compile | Clean |
 | Offline check suite | 241/241 (249/249 with `--live`) |
+
+### 2026-10-16 12:32 PT — CPI alert drops the code block for plain fields
+
+**Changed — headline and core are now one field each, and nothing is aligned.**
+
+```
+[ Headline CPI ]                         [ Headline CPI ]
+YoY **3.7%** · ▲︎ Accel · was 3.4%        Metric     Actual  Prior   Trend
+MoM **+0.6%** · ▲︎ Accel · was +0.4%      Headline
+                                         ↑   YoY        3.7%   3.4%   ▲︎ Accel
+[ Core CPI ]                                 MoM       +0.6%  +0.4%   ▲︎ Accel
+YoY **2.6%** · ▲︎ Accel · was 2.4%        Core
+MoM **+0.3%** · ⏸︎ Flat · was +0.3%         YoY        2.6%   2.4%   ▲︎ Accel
+                                             MoM       +0.3%  +0.3%   ⏸︎ Flat
+```
+
+**Why, in one line:** there is no way to align columns in Discord outside a code
+block. Messages and field values render in a **proportional font**, so `3.7%` and
+`+0.6%` are different widths and padding with spaces can never line anything up.
+Inline code is monospace but cannot span lines. The only monospace context that
+spans lines *is* a code block — and a code block scrolls sideways rather than
+wrapping.
+
+So the layout stopped fighting the renderer. Field headers group, bold
+emphasises, and lines wrap instead of scrolling.
+
+**The fields are full width, not inline.** Discord gives an inline field a third
+of the embed — about eighteen characters — and these lines run about thirty-six.
+Inline would wrap every reading mid-thought. A test asserts `inline is False` on
+all three.
+
+**Added — `metric_line()`**, one testable function per reading:
+
+```
+YoY **3.7%** · ▲︎ Accel · was 3.4%
+```
+
+Asserted as an exact string for both a monthly and a 12-month rate, so the
+signed/unsigned convention cannot drift.
+
+**Removed — `glance_table()` and its column constants.** Both earlier table
+layouts are preserved in git history at `a21af6a` if you want either back.
+
+**Verified**
+- `python verify.py` — **240/240 checks passed**, exit 0.
+- `python verify.py --live` — **248/248**.
+- Asserted **no field contains a code fence**, which is what "drop the code
+  block" actually means and is easy to reintroduce by accident.
+- Asserted the field names are the measure labels and the index field, in order,
+  and that each measure field is exactly two lines — one reading per period,
+  nothing wrapping by design.
+- Asserted every published figure is still present, and the status wording is the
+  short set (`Accel` ×3, `Flat` ×1) while `status_for()` still defaults to the
+  long wording.
+- Rendered from live FRED: longest *visible* line is the index levels at 51
+  characters. The 69-character line in the raw field value is the markdown link,
+  which Discord draws as the words "Read Full BLS Release".
+
+**One thing left as-is.** The markers keep `U+FE0E`. Outside a code block it no
+longer does alignment work — it now stops `⏸` rendering as a colour emoji while
+`▲` and `▼` stay monochrome, which would look like a mistake in a row of four.
+
+**Updated final state**
+
+| Check | Result |
+|---|---|
+| Cogs load offline | 4/4 |
+| Slash commands registered | 8 |
+| Background loops | `weekly_briefing` Mon 08:00 ET · `poll_macro_releases` every 15 min · `daily_check` daily 17:30 ET |
+| Tier-1 macro releases sourced | 4 of 5 (FOMC not sourceable from FRED) |
+| Macro alerts rendered from live FRED | 3/3, CPI matching the BLS release to the decimal |
+| CPI embed code blocks | 0 |
+| Chart timeframes resolved live | 5/5 |
+| Tracked files containing a secret | 0 |
+| Byte-compile | Clean |
+| Offline check suite | 240/240 (248/248 with `--live`) |

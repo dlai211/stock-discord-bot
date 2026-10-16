@@ -230,44 +230,26 @@ def base_period(units: str, fallback: str) -> str:
     return f"Base {text[6:]}" if text.lower().startswith("index ") else text
 
 
-# Column widths for the glance table, chosen so the widest row stays inside the
-# roughly 35 monospace columns a phone shows before a code block scrolls
-# sideways. A flat four-row table with the full status wording ran to 62.
-TABLE_METRIC_WIDTH = 10
-TABLE_VALUE_WIDTH = 7
-TABLE_TREND_GAP = 3
+# The two periods every inflation reading is quoted in, 12-month first, which is
+# the order BLS uses in its own summary.
+PERIOD_LABELS = (("yoy", "YoY"), ("mom", "MoM"))
 
 
-def glance_table(components: list[dict[str, Any]]) -> str:
-    """The 'Numbers at a Glance' monospace table.
+def metric_line(component: dict[str, Any], metric: str, label: str) -> str:
+    """One reading: 'YoY **3.7%** · ▲︎ Accel · was 3.4%'.
 
-    Grouped by measure rather than flattened, so headline and core stay visually
-    separate and "CPI" is not repeated on every row. Each group shows the
-    12-month change above the one-month change, matching the order BLS uses in
-    its own summary, and rates carry the single decimal the release quotes.
+    The value is bold, the direction sits beside it, and the prior follows. No
+    padding or alignment is involved — Discord renders field text in a
+    proportional font, so columns cannot line up outside a code block, and this
+    is built to read well without them.
+
+    Month-on-month is conventionally signed; the 12-month rate is not.
     """
-    lines = [
-        f"{'Metric':<{TABLE_METRIC_WIDTH}}"
-        f"{'Actual':>{TABLE_VALUE_WIDTH}}"
-        f"{'Prior':>{TABLE_VALUE_WIDTH}}"
-        f"{' ' * TABLE_TREND_GAP}Trend"
-    ]
-    for component in components:
-        lines.append(component["short"])
-        for metric, suffix in (("yoy", "YoY"), ("mom", "MoM")):
-            actual = component[metric]
-            prior = component["prior_" + metric]
-            # Month-on-month is conventionally signed; the 12-month rate is not.
-            shown = f"{actual:+.1f}%" if metric == "mom" else f"{actual:.1f}%"
-            shown_prior = f"{prior:+.1f}%" if metric == "mom" else f"{prior:.1f}%"
-            lines.append(
-                f"{'  ' + suffix:<{TABLE_METRIC_WIDTH}}"
-                f"{shown:>{TABLE_VALUE_WIDTH}}"
-                f"{shown_prior:>{TABLE_VALUE_WIDTH}}"
-                f"{' ' * TABLE_TREND_GAP}"
-                f"{status_for(actual, prior, short=True)}"
-            )
-    return "```\n" + "\n".join(lines) + "\n```"
+    actual = component[metric]
+    prior = component["prior_" + metric]
+    shown = f"{actual:+.1f}%" if metric == "mom" else f"{actual:.1f}%"
+    was = f"{prior:+.1f}%" if metric == "mom" else f"{prior:.1f}%"
+    return f"{label} **{shown}** · {status_for(actual, prior, short=True)} · was {was}"
 
 
 def as_mapping(info: Any) -> dict[str, Any]:
@@ -675,16 +657,26 @@ class MacroAlerts(commands.Cog):
 
     @staticmethod
     def _paired_fields(embed, components, meta, units) -> None:
-        """Headline and core together, as a monospace table.
+        """Headline and core as one field each.
 
-        A table rather than inline fields: four metrics as fields would wrap
-        three-to-a-row in Discord and strand the fourth on a line of its own.
+        Discord's own field headers do the grouping, so there is no table and no
+        code block — which means the values can be bold and the same text reads
+        the same in a phone client as on a desktop.
+
+        The fields are full width rather than inline. Discord gives an inline
+        field a third of the embed, roughly eighteen characters, and these lines
+        are about thirty-six; they would wrap mid-thought.
         """
-        embed.add_field(
-            name="The Numbers at a Glance",
-            value=glance_table(components),
-            inline=False,
-        )
+        for component in components:
+            embed.add_field(
+                name=component["label"],
+                value="\n".join(
+                    metric_line(component, metric, label)
+                    for metric, label in PERIOD_LABELS
+                ),
+                inline=False,
+            )
+
         levels = " | ".join(
             f"{component['short']} {component['value']:.2f}" for component in components
         )
